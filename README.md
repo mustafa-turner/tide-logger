@@ -14,8 +14,10 @@ Monitor dan dikirim ke dashboard Blynk melalui Wi-Fi.
 - Mengontrol catu A02YYUW melalui load switch BS250 dan PN2222A pada D0.
 - Membaca suhu dan kelembapan menggunakan Fermion DFRobot SHT40.
 - Menghitung ketinggian air terhadap datum/titik nol pengukuran.
-- Bangun, mengukur, mengirim satu paket data, lalu deep sleep dengan interval
-  total 5 menit.
+- Menyinkronkan waktu UTC melalui NTP dan menjadwalkan pengukuran pada batas
+  absolut 5 menit (`00`, `05`, `10`, dan seterusnya).
+- Menggunakan interval relatif 5 menit sebagai fallback apabila waktu UTC belum
+  tersedia.
 - Mengelola provisioning Wi-Fi, koneksi cloud, dan OTA melalui Blynk.Edgent.
 - Membatasi koneksi siklus normal selama 15 detik dan menyediakan jendela OTA
   15 detik setelah upload.
@@ -231,16 +233,39 @@ Urutan normal setiap lima menit:
 4. Tetapkan D0 LOW dan tahan pin LOW selama deep sleep.
 5. Baca SHT40 serta seluruh pengukuran INA3221 yang digunakan firmware.
 6. Jalankan Blynk.Edgent dengan batas koneksi total 15 detik.
-7. Setelah tersambung, kirim data segera setelah callback sync V6 diterima.
+7. Setelah Wi-Fi tersambung, mulai sinkronisasi waktu UTC melalui NTP tanpa
+   menghentikan proses Edgent.
+8. Setelah tersambung ke Blynk, kirim data segera setelah callback sync V6 dan
+   V17 diterima.
    Jika Blynk tidak mengirim nilai tersimpan, gunakan tinggi NVS setelah fallback
    3 detik, tanpa melewati deadline koneksi/upload 15 detik.
-8. Tetap online selama 15 detik sebagai jendela penerimaan Blynk.Air OTA.
-9. Deep sleep selama sisa interval sehingga awal siklus berikutnya berjarak
-   sekitar 5 menit dari awal siklus sekarang.
+9. Tetap online selama 15 detik sebagai jendela penerimaan Blynk.Air OTA.
+10. Jika waktu UTC valid, deep sleep sampai batas absolut lima menit berikutnya.
+    Jika waktu belum valid, gunakan sisa interval relatif lima menit.
 
 Jika V17 bernilai `1`, langkah deep sleep dilewati. Perangkat tetap melayani
-Blynk.Edgent dan memulai pengukuran baru setiap 5 menit tanpa restart. Ubah V17
-kembali menjadi `0` untuk memulihkan deep sleep setelah siklus aktif selesai.
+Blynk.Edgent dan memulai pengukuran baru pada batas absolut 5 menit tanpa
+restart. Jika waktu UTC belum tersedia, mode ini kembali memakai interval
+relatif. Ubah V17 menjadi `0` untuk memulihkan deep sleep setelah siklus aktif
+selesai.
+
+### Waktu NTP dan jadwal absolut
+
+Firmware versi `1.2.0` menggunakan UTC agar jadwal tidak dipengaruhi zona waktu
+atau perubahan konfigurasi lokal. Server yang dicoba adalah `pool.ntp.org`,
+`time.google.com`, dan `time.cloudflare.com`. Permintaan NTP berjalan setelah
+Wi-Fi tersambung dan tidak menambah proses blocking baru ke siklus Edgent.
+
+Setelah waktu valid, awal siklus diarahkan ke timestamp yang habis dibagi 300
+detik. Contohnya: `00:00`, `00:05`, `00:10`, dan seterusnya. RTC internal ESP32
+mempertahankan acuan waktu selama deep sleep, sedangkan koneksi berikutnya
+memulai sinkronisasi NTP kembali untuk mengoreksi drift.
+
+Jika NTP belum tersedia, perangkat tetap mengukur dan tidur memakai interval
+relatif sehingga kegagalan server waktu tidak menghentikan stasiun. Setelah mati
+daya penuh tanpa koneksi internet, timestamp absolut tidak dapat dipastikan
+sampai NTP berhasil kembali. Penyimpanan data offline bertimestamp belum termasuk
+dalam versi ini dan akan menjadi tahap terpisah.
 
 Provisioning pertama merupakan pengecualian: perangkat tetap terjaga dan sensor
 tetap OFF sampai konfigurasi Edgent berhasil. Timeout koneksi hanya berlaku pada
@@ -337,8 +362,10 @@ Solar CH1: 18.400 V
 Baterai CH2: 4.012 V
 Sistem CH3: 5.016 V, 0.350 A
 SHT40: 28.50 C, 76.20 %RH
+Sinkronisasi waktu UTC melalui NTP dimulai.
+Waktu UTC tersedia: 2026-08-07 12:04:27 UTC.
 Data siklus terkirim; membuka jendela OTA 15000 ms.
-Siklus selesai dalam 38000 ms; deep sleep 262000 ms.
+Siklus selesai dalam 38000 ms; deep sleep 18000 ms; bangun pada 2026-08-07 12:05:00 UTC.
 ```
 
 ## Pemecahan masalah
@@ -364,6 +391,9 @@ Siklus selesai dalam 38000 ms; deep sleep 262000 ms.
 - **Blynk offline:** periksa jaringan hasil provisioning, Template ID, akses
   internet, dan status device di Blynk Console. Tahan BOOT sekitar 10 detik untuk
   mengulang provisioning.
+- **NTP belum memberikan waktu:** pastikan DNS dan UDP port 123 tidak diblokir
+  jaringan. Firmware tetap berjalan dengan jadwal relatif dan mencoba NTP lagi
+  setelah boot/deep sleep berikutnya.
 - **Perangkat tidak masuk deep sleep:** pastikan switch V17 bernilai `0`.
 - **OTA belum mulai:** shipment Blynk.Air dapat menunggu hingga perangkat bangun
   pada siklus berikutnya. Pastikan perangkat sempat online dan jangan memutus
