@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transkrip Review Teknis Solar Tidal Station</title>
+  <style>
+    @page { size: A4; margin: 18mm 17mm 20mm; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: #17212b;
+      background: #fff;
+      font: 10.5pt/1.52 "Segoe UI", Arial, sans-serif;
+    }
+    .cover {
+      min-height: 250mm;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      border-top: 9px solid #087f8c;
+      page-break-after: always;
+    }
+    .eyebrow {
+      margin-bottom: 14px;
+      color: #087f8c;
+      font-size: 10pt;
+      font-weight: 700;
+      letter-spacing: 1.8px;
+      text-transform: uppercase;
+    }
+    h1 {
+      max-width: 670px;
+      margin: 0 0 20px;
+      color: #103b46;
+      font-size: 31pt;
+      line-height: 1.12;
+      letter-spacing: -0.5px;
+    }
+    .subtitle {
+      max-width: 620px;
+      margin: 0 0 45px;
+      color: #52616b;
+      font-size: 14pt;
+      line-height: 1.45;
+    }
+    .meta {
+      width: 100%;
+      max-width: 560px;
+      border-collapse: collapse;
+      color: #35444d;
+    }
+    .meta td { padding: 6px 0; border-bottom: 1px solid #dce5e7; }
+    .meta td:first-child { width: 145px; color: #6b7980; }
+    h2 {
+      margin: 25px 0 10px;
+      padding-bottom: 5px;
+      border-bottom: 2px solid #9ac6ca;
+      color: #0a5964;
+      font-size: 17pt;
+      line-height: 1.25;
+      break-after: avoid;
+    }
+    h3 {
+      margin: 19px 0 7px;
+      color: #174e59;
+      font-size: 12.5pt;
+      break-after: avoid;
+    }
+    p { margin: 7px 0 10px; }
+    ul, ol { margin: 6px 0 11px 22px; padding: 0; }
+    li { margin: 3px 0; }
+    table {
+      width: 100%;
+      margin: 11px 0 17px;
+      border-collapse: collapse;
+      font-size: 9.2pt;
+      break-inside: avoid;
+    }
+    th, td {
+      padding: 7px 8px;
+      border: 1px solid #bdcccf;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { color: #fff; background: #176d77; }
+    tr:nth-child(even) td { background: #f3f8f8; }
+    code {
+      padding: 1px 4px;
+      border-radius: 3px;
+      color: #7a2c14;
+      background: #f5eee9;
+      font: 9.4pt Consolas, monospace;
+    }
+    pre {
+      margin: 10px 0 14px;
+      padding: 11px 13px;
+      border-left: 4px solid #28a3ad;
+      color: #eaf7f8;
+      background: #17363d;
+      white-space: pre-wrap;
+      font: 9.2pt/1.45 Consolas, monospace;
+      break-inside: avoid;
+    }
+    .prompt, .note {
+      margin: 12px 0 17px;
+      padding: 12px 14px;
+      border-radius: 5px;
+      background: #edf6f7;
+      border: 1px solid #c6dfe2;
+    }
+    .note { background: #fff8e7; border-color: #ead69d; }
+    .label {
+      display: block;
+      margin-bottom: 4px;
+      color: #087f8c;
+      font-size: 8.7pt;
+      font-weight: 700;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+    }
+    .footer-note {
+      margin-top: 28px;
+      padding-top: 9px;
+      border-top: 1px solid #bdcccf;
+      color: #6b7980;
+      font-size: 8.5pt;
+    }
+    .page-break { page-break-before: always; }
+  </style>
+</head>
+<body>
+  <section class="cover">
+    <div class="eyebrow">Transkrip Review Teknis</div>
+    <h1>Solar Tidal Station Berbasis XIAO ESP32-S3</h1>
+    <p class="subtitle">Review rekomendasi konsultasi terhadap firmware aktual: A02YYUW, filtering, INA3221, Blynk.Edgent, penghematan energi, dan deep sleep.</p>
+    <table class="meta">
+      <tr><td>Tanggal</td><td>5 Agustus 2026</td></tr>
+      <tr><td>Proyek</td><td>ESP31-S3 INA3221 / Stasiun Pasang Surut</td></tr>
+      <tr><td>Dokumen acuan</td><td>Transkrip_Konsultasi_Solar_Tidal_Station.pdf</td></tr>
+      <tr><td>Status</td><td>Review saja—tidak ada perubahan firmware atau build</td></tr>
+    </table>
+  </section>
+
+  <main>
+    <div class="prompt">
+      <span class="label">Permintaan pengguna</span>
+      Lakukan review terhadap transkrip konsultasi dan sesuaikan penilaiannya dengan kode proyek saat ini, tanpa langsung menerapkan perubahan atau menjalankan build.
+    </div>
+
+    <h2>Kesimpulan review</h2>
+    <p>Rekomendasi di transkrip secara umum bagus dan relevan, tetapi firmware sekarang masih beroperasi sebagai monitor kontinu setiap satu detik. Arsitekturnya belum sesuai dengan target stasiun tenaga surya yang bangun setiap lima menit, mengukur, mengirim, lalu deep sleep.</p>
+
+    <table>
+      <thead><tr><th>Area</th><th>Rekomendasi transkrip</th><th>Firmware saat ini</th></tr></thead>
+      <tbody>
+        <tr><td>Interval</td><td>Siklus 5 menit</td><td>Membaca dan mengirim setiap 1 detik</td></tr>
+        <tr><td>A02YYUW</td><td>50 sampel, median + MAD + trimmed mean</td><td>Menggunakan satu frame valid terakhir</td></tr>
+        <tr><td>Mode A02YYUW</td><td>RX ke GND, real-time</td><td>Dokumentasi proyek masih memakai RX floating/processed</td></tr>
+        <tr><td>Power sensor</td><td>Diputus load switch saat tidur</td><td>Sensor selalu mendapat daya</td></tr>
+        <tr><td>Temperatur</td><td>Direkam, koreksi opsional</td><td>Suhu/kelembapan direkam, belum mengoreksi jarak</td></tr>
+        <tr><td>INA3221</td><td>Single-shot lalu power-down</td><td>Continuous conversion <code>0x7127</code></td></tr>
+        <tr><td>CH1 solar</td><td>Tegangan dan arus</td><td>Hanya tegangan</td></tr>
+        <tr><td>CH2 baterai</td><td>Tegangan dan signed net current</td><td>Hanya tegangan</td></tr>
+        <tr><td>CH3 sistem</td><td>Tegangan dan arus</td><td>Sudah membaca keduanya</td></tr>
+        <tr><td>Wi-Fi</td><td>Timeout lalu tidur</td><td>Blynk.Edgent mengelola koneksi secara terus-menerus</td></tr>
+        <tr><td>Penyimpanan gagal kirim</td><td>Backlog lokal</td><td>Belum tersedia</td></tr>
+        <tr><td>Deep sleep</td><td>Wajib untuk hemat energi</td><td>Belum tersedia</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Bagian yang paling layak diterapkan</h2>
+
+    <h3>1. Filtering A02YYUW</h3>
+    <p>Ini perubahan paling bernilai untuk kualitas pengukuran. Saat ini <code>readA02YYUW()</code> sudah benar dalam hal mencari header <code>0xFF</code>, memeriksa checksum, dan membatasi jarak ke 30–4500 mm. Namun, satu frame valid langsung menjadi hasil pengukuran. Untuk permukaan bergelombang, pantulan dinding, hujan, atau serangga, itu belum cukup kuat.</p>
+    <p>Adaptasi yang disarankan:</p>
+    <ol>
+      <li>Nyalakan sensor.</li>
+      <li>Tunggu 500–1000 ms.</li>
+      <li>Buang 5–10 frame pertama.</li>
+      <li>Kumpulkan 50 frame valid.</li>
+      <li>Hitung median.</li>
+      <li>Hitung MAD.</li>
+      <li>Tolak sampel di luar batas berikut.</li>
+    </ol>
+    <pre>abs(sample - median) &lt;= max(3 × 1.4826 × MAD, 20 mm)</pre>
+    <ol start="8">
+      <li>Buang 10% nilai terendah dan tertinggi.</li>
+      <li>Hitung rata-rata sisanya.</li>
+      <li>Tandai hasil buruk jika sampel yang lolos kurang dari 60%.</li>
+    </ol>
+    <p>Tidak disarankan menggunakan <code>std::vector</code> secara intensif pada siklus berulang. Array tetap seperti <code>uint16_t samples[50]</code> lebih cocok untuk mikrokontroler dan menghindari fragmentasi heap.</p>
+
+    <h3>2. Mode real-time A02YYUW</h3>
+    <p>Untuk filtering sendiri, rekomendasi RX A02YYUW ke GND masuk akal. Firmware sekarang tidak mengirim perintah apa pun ke sensor, sehingga pin TX ESP32 pada D6 sebenarnya tidak diperlukan untuk komunikasi.</p>
+    <p>Konfigurasi yang lebih bersih:</p>
+    <ul>
+      <li>A02YYUW TX → XIAO D7/RX.</li>
+      <li>A02YYUW RX → GND.</li>
+      <li>UART ESP32 dapat diinisialisasi hanya dengan RX, tanpa TX jika framework mengizinkan pin TX negatif.</li>
+    </ul>
+    <p>Processed mode juga tetap bisa dipakai, tetapi kemudian 50 sampel sering berlebihan karena sensor sudah melakukan pemrosesan internal.</p>
+
+    <h3>3. Load switch untuk A02YYUW</h3>
+    <p>Sangat direkomendasikan jika deep sleep diterapkan. Membuat ESP32 tidur tetapi membiarkan A02YYUW terus menyala akan mengurangi manfaat penghematan secara signifikan.</p>
+    <p>D0 sekarang sudah bebas setelah fungsi LED dihapus, sehingga berpotensi dipakai sebagai <code>SENSOR_POWER_ENABLE</code>. Namun keputusan final harus mengikuti rangkaian load switch:</p>
+    <ul>
+      <li>Enable harus kompatibel dengan logika 3,3 V.</li>
+      <li>Kondisi default saat boot harus OFF.</li>
+      <li>Jangan menyalakan A02YYUW langsung dari GPIO.</li>
+      <li>Pastikan tidak terjadi backfeeding melalui jalur UART.</li>
+    </ul>
+    <pre>power sensor ON
+→ tunggu stabil
+→ bersihkan buffer UART
+→ buang frame awal
+→ ambil dan filter sampel
+→ power sensor OFF</pre>
+
+    <h3>4. Deep sleep lima menit</h3>
+    <p>Ini perubahan arsitektur terbesar. Interval harus dihitung dari awal siklus:</p>
+    <pre>sleep = 300 detik - durasi aktif</pre>
+    <p>Bukan selalu tidur 300 detik setelah pekerjaan selesai. Data yang perlu bertahan di RTC memory antara siklus dapat mencakup nomor siklus, timestamp relatif, status backlog, dan jumlah kegagalan koneksi. Konfigurasi Wi-Fi serta token Blynk.Edgent sudah disimpan secara permanen oleh Edgent sehingga tidak perlu disimpan ulang oleh aplikasi.</p>
+
+    <h2 class="page-break">Konflik penting dengan Blynk.Edgent</h2>
+    <p>Blynk.Edgent dirancang sebagai state machine yang terus dijalankan melalui:</p>
+    <pre>BlynkEdgent.run();</pre>
+    <p>Deep sleep tetap dapat digunakan, tetapi perlu pendekatan khusus:</p>
+    <ul>
+      <li>Saat perangkat belum pernah diprovisioning, Edgent harus diberi waktu tanpa batas pendek agar pengguna dapat menyelesaikan provisioning.</li>
+      <li>Setelah sudah diprovisioning, setiap bangun perangkat mencoba koneksi dalam batas waktu tertentu.</li>
+      <li>Jika koneksi gagal, perangkat harus tidur kembali.</li>
+      <li>Blynk.Air OTA hanya dapat diterima ketika perangkat sedang bangun dan online.</li>
+    </ul>
+    <p>Jika perangkat hanya aktif sekitar 15–30 detik setiap lima menit, OTA masih mungkin, tetapi jendela penerimaannya sempit. Strategi yang lebih aman adalah menyediakan mode maintenance:</p>
+    <ul>
+      <li>Tombol BOOT ditekan ketika startup → perangkat tetap aktif untuk provisioning/OTA.</li>
+      <li>Siklus normal → ukur, kirim, lalu tidur.</li>
+      <li>Sesekali perangkat tetap online lebih lama untuk memeriksa OTA.</li>
+    </ul>
+    <div class="note">Konfigurasi Edgent bawaan yang sekarang dipakai mempunyai timeout jaringan/cloud sekitar 50 detik. Ini lebih lama daripada rekomendasi transkrip 10–15 detik dan perlu disesuaikan jika prioritas utama adalah penghematan baterai.</div>
+
+    <h2>INA3221</h2>
+    <p>Pemetaan channel sekarang sudah sama secara fungsi dasar:</p>
+    <ul>
+      <li>CH1: solar.</li>
+      <li>CH2: baterai.</li>
+      <li>CH3: sistem 5 V.</li>
+    </ul>
+    <p>Namun firmware baru membaca CH1 tegangan solar, CH2 tegangan baterai, serta CH3 tegangan dan arus sistem. Jadi rekomendasi transkrip belum sepenuhnya terpenuhi. Untuk analisis energi lengkap perlu menambahkan:</p>
+    <ul>
+      <li>Register shunt CH1 <code>0x01</code>.</li>
+      <li>Register shunt CH2 <code>0x03</code>.</li>
+      <li>Resistor shunt masing-masing channel.</li>
+      <li>Signed current untuk CH1, CH2, dan CH3.</li>
+      <li>Perhitungan daya setiap channel.</li>
+    </ul>
+    <p>Khusus CH2, arah arus harus dikalibrasi sehingga tanda positif/negatif jelas berarti charging atau discharging. Posisi shunt baterai juga menentukan apakah yang terbaca benar-benar arus bersih baterai.</p>
+    <p>Nilai resistor tidak sebaiknya memakai satu konstanta untuk semua channel tanpa pemeriksaan fisik:</p>
+    <pre>constexpr float CH1_SHUNT_OHM = 0.1f;
+constexpr float CH2_SHUNT_OHM = 0.1f;
+constexpr float CH3_SHUNT_OHM = 0.1f;</pre>
+    <p>Firmware sekarang menggunakan continuous conversion. Untuk siklus lima menit, single-shot lalu power-down lebih hemat. Konfigurasinya perlu mengikuti waktu konversi dan averaging agar firmware menunggu conversion-ready sebelum membaca register.</p>
+
+    <h2>Kompensasi temperatur</h2>
+    <p>SHT40 sudah tersedia dan dibaca, jadi fondasinya sudah ada. Koreksi temperatur belum perlu langsung dijadikan nilai utama. Untuk fase commissioning, kirim tiga nilai:</p>
+    <ul>
+      <li>Jarak hasil filtering tanpa koreksi.</li>
+      <li>Temperatur udara.</li>
+      <li>Jarak dengan koreksi temperatur sebagai pembanding.</li>
+    </ul>
+    <p>Rumus rasio kecepatan suara masuk akal jika didahului kalibrasi pada temperatur referensi:</p>
+    <pre>corrected =
+    filtered * calibrationFactor *
+    speedOfSound(currentTemperature) /
+    speedOfSound(referenceTemperature);</pre>
+    <p>SHT40 harus mengukur udara di dekat jalur ultrasonik, bukan udara panas di dalam enclosure. Jika penempatannya salah, koreksi matematis justru dapat memperburuk hasil. Kelembapan boleh direkam untuk diagnosis, tetapi pengaruh temperatur jauh lebih dominan.</p>
+
+    <h2>Blynk dan kualitas data</h2>
+    <p>Virtual pin saat ini V0–V8 sudah terpakai. Jangan langsung menambahkan semua parameter dalam transkrip sekaligus. Untuk tahap awal, parameter paling berguna adalah:</p>
+    <ul>
+      <li>Jumlah sampel valid.</li>
+      <li>Jumlah sampel ditolak.</li>
+      <li>MAD.</li>
+      <li>Status kualitas.</li>
+      <li>Jarak filtered raw.</li>
+      <li>Durasi aktif.</li>
+      <li>RSSI Wi-Fi.</li>
+    </ul>
+    <p><code>measurement_quality</code> sebaiknya direpresentasikan sebagai integer/enum agar mudah dipakai dalam event dan dashboard:</p>
+    <pre>0 = invalid
+1 = poor
+2 = good</pre>
+
+    <h2>Penyimpanan lokal</h2>
+    <p>Saran menyimpan backlog ketika internet gagal bagus, tetapi tidak perlu menjadi perubahan pertama. Implementasi yang aman membutuhkan format record tetap, timestamp yang valid, batas jumlah record, perlindungan terhadap penulisan flash berlebihan, dan penghapusan hanya setelah cloud mengonfirmasi pengiriman.</p>
+    <p>LittleFS cocok untuk backlog berukuran terbatas. Namun timestamp memerlukan sinkronisasi waktu; setelah deep sleep, waktu dapat dipertahankan lewat RTC atau disinkronkan ketika jaringan tersedia.</p>
+
+    <h2>Catatan terhadap beberapa klaim transkrip</h2>
+    <p>Beberapa angka konsumsi A02YYUW merupakan estimasi berdasarkan nilai maksimum/typical. Angka penghematan 95–97% masuk akal secara duty cycle, tetapi konsumsi sistem nyata tetap harus diukur karena regulator Waveshare, breakout INA3221, LED pada board, dan efisiensi konversi dapat mendominasi.</p>
+    <p>Pernyataan “ukur sebelum Wi-Fi agar noise tidak mengganggu” layak diterapkan. Namun pembacaan tegangan ketika Wi-Fi aktif juga berguna untuk mengetahui voltage sag. Jadi pengukuran terbaik adalah dua tahap:</p>
+    <ol>
+      <li>INA3221 sebelum Wi-Fi.</li>
+      <li>INA3221 ketika Wi-Fi sedang aktif.</li>
+    </ol>
+
+    <h2>Urutan implementasi yang direkomendasikan</h2>
+    <ol>
+      <li>Filtering 50 sampel A02YYUW dan quality metrics.</li>
+      <li>Ubah A02YYUW ke real-time mode.</li>
+      <li>Tambahkan load switch sensor.</li>
+      <li>Lengkapi pembacaan arus CH1 dan CH2.</li>
+      <li>Ubah INA3221 menjadi single-shot.</li>
+      <li>Susun siklus bangun–ukur–kirim–tidur lima menit.</li>
+      <li>Tambahkan timeout koneksi yang kompatibel dengan Edgent.</li>
+      <li>Tambahkan mode maintenance untuk provisioning dan OTA.</li>
+      <li>Rekam jarak raw dan temperature-corrected secara paralel.</li>
+      <li>Tambahkan backlog lokal setelah siklus utama stabil.</li>
+    </ol>
+    <div class="note"><strong>Rekomendasi utama:</strong> jangan menerapkan seluruh transkrip dalam satu perubahan besar. Filtering, power switching, deep sleep, Edgent, dan backlog masing-masing mengubah state machine firmware. Implementasi bertahap akan jauh lebih mudah diuji dan dikalibrasi di lapangan.</div>
+
+    <p class="footer-note">Dokumen ini dibuat dari jawaban review teknis Codex pada percakapan proyek Solar Tidal Station. Tidak ada perubahan kode maupun build yang dilakukan sebagai bagian dari review tersebut.</p>
+  </main>
+</body>
+</html>
