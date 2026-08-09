@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.1.1"
+#define BLYNK_FIRMWARE_VERSION "1.2.0"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -14,6 +14,8 @@
 #include <WiFi.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
+#include <sys/time.h>
+#include <time.h>
 
 namespace {
 constexpr uint8_t INA3221_ADDRESS = 0x40;
@@ -41,11 +43,18 @@ constexpr uint32_t A02YYUW_ACQUISITION_TIMEOUT_MS = 20000;
 constexpr float A02YYUW_MIN_OUTLIER_LIMIT_MM = 20.0f;
 constexpr float A02YYUW_GOOD_MAX_MAD_MM = 30.0f;
 
-constexpr uint32_t MEASUREMENT_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr uint32_t MEASUREMENT_INTERVAL_SECONDS = 5UL * 60UL;
+constexpr uint32_t MEASUREMENT_INTERVAL_MS =
+    MEASUREMENT_INTERVAL_SECONDS * 1000UL;
 constexpr uint32_t EDGENT_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint32_t BLYNK_SYNC_FALLBACK_MS = 3000;
 constexpr uint32_t OTA_LISTEN_WINDOW_MS = 15000;
 constexpr uint32_t MINIMUM_SLEEP_MS = 1000;
+constexpr uint32_t NTP_SYNC_STATUS_TIMEOUT_MS = 10000;
+constexpr time_t MIN_VALID_UTC_EPOCH = 1704067200;  // 2024-01-01 00:00 UTC
+constexpr char NTP_SERVER_PRIMARY[] = "pool.ntp.org";
+constexpr char NTP_SERVER_SECONDARY[] = "time.google.com";
+constexpr char NTP_SERVER_TERTIARY[] = "time.cloudflare.com";
 constexpr char STAY_AWAKE_KEY[] = "stay_awake";
 
 // Jarak vertikal sensor ke titik nol/dasar pengukuran pasang surut.
@@ -120,6 +129,121 @@ bool deepSleepDisabled = false;
 uint32_t edgentConnectStartedAt = 0;
 uint32_t blynkConnectedAt = 0;
 uint32_t cycleUploadedAt = 0;
+bool ntpSyncRequested = false;
+bool ntpSyncTimeoutReported = false;
+bool utcTimeAvailableReported = false;
+uint32_t ntpSyncRequestedAt = 0;
+bool cycleAbsoluteSlotValid = false;
+uint64_t cycleAbsoluteSlot = 0;
+
+bool getValidUtcTime(timeval &utcNow) {
+  gettimeofday(&utcNow, nullptr);
+  return utcNow.tv_sec >= MIN_VALID_UTC_EPOCH;
+}
+
+bool formatUtcTimestamp(time_t epoch, char *buffer, size_t bufferLength) {
+  tm utcTime = {};
+  if (gmtime_r(&epoch, &utcTime) == nullptr) {
+    return false;
+  }
+  return strftime(buffer, bufferLength, "%Y-%m-%d %H:%M:%S UTC", &utcTime) >
+         0;
+}
+
+void captureCurrentAbsoluteSlot() {
+  timeval utcNow = {};
+  if (!getValidUtcTime(utcNow)) {
+    cycleAbsoluteSlotValid = false;
+    return;
+  }
+
+  cycleAbsoluteSlot =
+      static_cast<uint64_t>(utcNow.tv_sec) / MEASUREMENT_INTERVAL_SECONDS;
+  cycleAbsoluteSlotValid = true;
+
+  char timestamp[32] = {};
+  if (formatUtcTimestamp(utcNow.tv_sec, timestamp, sizeof(timestamp))) {
+    Serial.printf("Slot waktu siklus: %s (slot %llu).\n", timestamp,
+                  static_cast<unsigned long long>(cycleAbsoluteSlot));
+  }
+}
+
+void serviceNetworkTime() {
+  if (WiFi.status() == WL_CONNECTED && !ntpSyncRequested) {
+    configTime(0, 0, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY,
+               NTP_SERVER_TERTIARY);
+    ntpSyncRequested = true;
+    ntpSyncRequestedAt = millis();
+    Serial.println("Sinkronisasi waktu UTC melalui NTP dimulai.");
+  }
+
+  timeval utcNow = {};
+  if (getValidUtcTime(utcNow)) {
+    if (!utcTimeAvailableReported) {
+      utcTimeAvailableReported = true;
+      char timestamp[32] = {};
+      if (formatUtcTimestamp(utcNow.tv_sec, timestamp, sizeof(timestamp))) {
+        Serial.printf("Waktu UTC tersedia: %s.\n", timestamp);
+      }
+    }
+    if (normalCycleStarted && !cycleAbsoluteSlotValid) {
+      captureCurrentAbsoluteSlot();
+      Serial.println("Siklus berikutnya akan mengikuti batas absolut 5 menit.");
+    }
+    return;
+  }
+
+  if (ntpSyncRequested && !ntpSyncTimeoutReported &&
+      millis() - ntpSyncRequestedAt >= NTP_SYNC_STATUS_TIMEOUT_MS) {
+    ntpSyncTimeoutReported = true;
+    Serial.println("NTP belum memberikan waktu; jadwal relatif dipakai sementara.");
+  }
+}
+
+bool stayAwakeCycleIsDue() {
+  timeval utcNow = {};
+  if (getValidUtcTime(utcNow)) {
+    const uint64_t currentSlot =
+        static_cast<uint64_t>(utcNow.tv_sec) / MEASUREMENT_INTERVAL_SECONDS;
+    if (!cycleAbsoluteSlotValid) {
+      cycleAbsoluteSlot = currentSlot;
+      cycleAbsoluteSlotValid = true;
+      return false;
+    }
+    return currentSlot > cycleAbsoluteSlot;
+  }
+
+  return millis() - cycleStartedAt >= MEASUREMENT_INTERVAL_MS;
+}
+
+bool calculateAbsoluteSleep(uint64_t &sleepDurationUs,
+                            time_t &nextWakeEpoch) {
+  timeval utcNow = {};
+  if (!getValidUtcTime(utcNow)) {
+    return false;
+  }
+
+  constexpr uint64_t MICROSECONDS_PER_SECOND = 1000000ULL;
+  const uint64_t intervalUs =
+      static_cast<uint64_t>(MEASUREMENT_INTERVAL_SECONDS) *
+      MICROSECONDS_PER_SECOND;
+  const uint64_t currentEpochUs =
+      static_cast<uint64_t>(utcNow.tv_sec) * MICROSECONDS_PER_SECOND +
+      static_cast<uint32_t>(utcNow.tv_usec);
+  const uint64_t elapsedInSlotUs = currentEpochUs % intervalUs;
+  sleepDurationUs = intervalUs - elapsedInSlotUs;
+
+  // Hindari bangun ulang hampir seketika apabila proses selesai tepat sebelum
+  // batas slot. Dalam kondisi ini gunakan batas lima menit sesudahnya.
+  if (sleepDurationUs < 100000ULL) {
+    sleepDurationUs += intervalUs;
+  }
+
+  nextWakeEpoch =
+      static_cast<time_t>((currentEpochUs + sleepDurationUs) /
+                          MICROSECONDS_PER_SECOND);
+  return true;
+}
 
 void resetA02FrameParser() {
   memset(a02Frame, 0, sizeof(a02Frame));
@@ -486,6 +610,8 @@ void finalizeA02YYUWMeasurement() {
 void startNormalMeasurementCycle() {
   cycleStartedAt = millis();
   normalCycleStarted = true;
+  cycleAbsoluteSlotValid = false;
+  captureCurrentAbsoluteSlot();
   automaticMeasurementComplete = false;
   otherMeasurementsComplete = false;
   cycleUploaded = false;
@@ -694,14 +820,31 @@ void enterTimedDeepSleep() {
 
   setA02YYUWPower(false);
   const uint32_t activeDurationMs = millis() - cycleStartedAt;
-  const uint32_t sleepDurationMs =
-      activeDurationMs < MEASUREMENT_INTERVAL_MS
-          ? MEASUREMENT_INTERVAL_MS - activeDurationMs
-          : MINIMUM_SLEEP_MS;
+  uint64_t sleepDurationUs = 0;
+  time_t nextWakeEpoch = 0;
+  const bool absoluteScheduleAvailable =
+      calculateAbsoluteSleep(sleepDurationUs, nextWakeEpoch);
 
-  Serial.printf("Siklus selesai dalam %lu ms; deep sleep %lu ms.\n",
-                static_cast<unsigned long>(activeDurationMs),
-                static_cast<unsigned long>(sleepDurationMs));
+  if (absoluteScheduleAvailable) {
+    char nextWakeTimestamp[32] = {};
+    formatUtcTimestamp(nextWakeEpoch, nextWakeTimestamp,
+                       sizeof(nextWakeTimestamp));
+    Serial.printf("Siklus selesai dalam %lu ms; deep sleep %llu ms; "
+                  "bangun pada %s.\n",
+                  static_cast<unsigned long>(activeDurationMs),
+                  static_cast<unsigned long long>(sleepDurationUs / 1000ULL),
+                  nextWakeTimestamp);
+  } else {
+    const uint32_t fallbackSleepMs =
+        activeDurationMs < MEASUREMENT_INTERVAL_MS
+            ? MEASUREMENT_INTERVAL_MS - activeDurationMs
+            : MINIMUM_SLEEP_MS;
+    sleepDurationUs = static_cast<uint64_t>(fallbackSleepMs) * 1000ULL;
+    Serial.printf("Siklus selesai dalam %lu ms; NTP belum tersedia; "
+                  "deep sleep relatif %lu ms.\n",
+                  static_cast<unsigned long>(activeDurationMs),
+                  static_cast<unsigned long>(fallbackSleepMs));
+  }
 
   Blynk.disconnect();
   WiFi.disconnect(true, false);
@@ -714,8 +857,7 @@ void enterTimedDeepSleep() {
   gpio_hold_en(static_cast<gpio_num_t>(A02YYUW_POWER_PIN));
   gpio_deep_sleep_hold_en();
 
-  esp_sleep_enable_timer_wakeup(
-      static_cast<uint64_t>(sleepDurationMs) * 1000ULL);
+  esp_sleep_enable_timer_wakeup(sleepDurationUs);
   Serial.flush();
   esp_deep_sleep_start();
 }
@@ -723,6 +865,7 @@ void enterTimedDeepSleep() {
 
 BLYNK_CONNECTED() {
   blynkConnectedAt = millis();
+  serviceNetworkTime();
   v6SyncReceived = false;
   v17SyncReceived = false;
   // Ambil nilai terakhir V6 dan V17 yang tersimpan di Blynk Cloud.
@@ -831,6 +974,7 @@ void setup() {
   Serial.printf("Tinggi referensi sensor awal: %lu mm\n",
                 static_cast<unsigned long>(sensorHeightMm));
   Serial.println("Provisioning Wi-Fi dan koneksi cloud dikelola Blynk.Edgent.");
+  Serial.println("Jadwal UTC absolut 5 menit aktif setelah waktu NTP tersedia.");
   Serial.printf("V17 Stay Awake tersimpan: %s (deep sleep %s).\n",
                 deepSleepDisabled ? "ON" : "OFF",
                 deepSleepDisabled ? "nonaktif" : "aktif");
@@ -858,6 +1002,8 @@ void setup() {
 }
 
 void loop() {
+  serviceNetworkTime();
+
   // Provisioning pertama tidak dibatasi timeout dan tidak masuk deep sleep.
   if (!normalCycleStarted) {
     BlynkEdgent.run();
@@ -959,8 +1105,8 @@ void loop() {
   // Tanpa deep sleep, mulai siklus pengukuran baru setiap lima menit tanpa
   // me-restart ESP32. Jalur provisioning di atas tetap memiliki prioritas.
   if (deepSleepDisabled && otherMeasurementsComplete &&
-      millis() - cycleStartedAt >= MEASUREMENT_INTERVAL_MS) {
-    Serial.println("V17 Stay Awake aktif: memulai siklus 5 menit berikutnya.");
+      stayAwakeCycleIsDue()) {
+    Serial.println("V17 Stay Awake aktif: memulai slot 5 menit berikutnya.");
     startNormalMeasurementCycle();
     return;
   }
