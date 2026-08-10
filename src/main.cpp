@@ -1,7 +1,8 @@
 #include <Arduino.h>
+#include "OfflineQueue.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.2.0"
+#define BLYNK_FIRMWARE_VERSION "1.3.0"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -51,6 +52,9 @@ constexpr uint32_t BLYNK_SYNC_FALLBACK_MS = 3000;
 constexpr uint32_t OTA_LISTEN_WINDOW_MS = 15000;
 constexpr uint32_t MINIMUM_SLEEP_MS = 1000;
 constexpr uint32_t NTP_SYNC_STATUS_TIMEOUT_MS = 10000;
+constexpr uint32_t UPLOAD_ACK_REQUEST_DELAY_MS = 100;
+constexpr uint32_t UPLOAD_ACK_TIMEOUT_MS = 1500;
+constexpr uint8_t MAX_RECORD_UPLOADS_PER_CYCLE = 2;
 constexpr time_t MIN_VALID_UTC_EPOCH = 1704067200;  // 2024-01-01 00:00 UTC
 constexpr char NTP_SERVER_PRIMARY[] = "pool.ntp.org";
 constexpr char NTP_SERVER_SECONDARY[] = "time.google.com";
@@ -135,6 +139,26 @@ bool utcTimeAvailableReported = false;
 uint32_t ntpSyncRequestedAt = 0;
 bool cycleAbsoluteSlotValid = false;
 uint64_t cycleAbsoluteSlot = 0;
+bool cycleStartedWithAbsoluteTime = false;
+tide::OfflineQueue offlineQueue;
+tide::MeasurementRecord currentCycleRecord = {};
+bool currentCycleRecordReady = false;
+bool currentCycleRecordQueued = false;
+uint32_t currentCycleSequence = 0;
+uint8_t recordsUploadedThisCycle = 0;
+uint32_t pendingUploadSequence = 0;
+uint32_t uploadStateChangedAt = 0;
+uint32_t lastCloudSequence = 0;
+bool pendingUploadAcknowledged = false;
+bool v21SyncReceived = false;
+
+enum class OfflineUploadState : uint8_t {
+  IDLE,
+  WAITING_TO_REQUEST_ACK,
+  WAITING_FOR_ACK,
+};
+
+OfflineUploadState offlineUploadState = OfflineUploadState::IDLE;
 
 bool getValidUtcTime(timeval &utcNow) {
   gettimeofday(&utcNow, nullptr);
@@ -303,38 +327,296 @@ void registerA02YYUWConsoleCommand() {
   });
 }
 
-void uploadToBlynk() {
+uint64_t estimateCurrentCycleTimestampMs() {
+  if (cycleStartedWithAbsoluteTime && cycleAbsoluteSlotValid) {
+    return cycleAbsoluteSlot * MEASUREMENT_INTERVAL_SECONDS * 1000ULL;
+  }
+
+  timeval utcNow = {};
+  if (!getValidUtcTime(utcNow)) {
+    return 0;
+  }
+
+  const uint64_t nowMs = static_cast<uint64_t>(utcNow.tv_sec) * 1000ULL +
+                         static_cast<uint32_t>(utcNow.tv_usec) / 1000ULL;
+  const uint32_t elapsedMs = millis() - cycleStartedAt;
+  return nowMs > elapsedMs ? nowMs - elapsedMs : 0;
+}
+
+tide::MeasurementRecord buildCurrentMeasurementRecord() {
+  tide::MeasurementRecord record = {};
+  if (batteryValid) {
+    record.flags |= tide::RECORD_BATTERY_VALID;
+    record.batteryVoltage = latestBatteryVoltage;
+  }
+  if (solarVoltageValid) {
+    record.flags |= tide::RECORD_SOLAR_VALID;
+    record.solarVoltage = latestSolarVoltage;
+  }
+  if (system5VVoltageValid) {
+    record.flags |= tide::RECORD_SYSTEM_VALID;
+    record.systemVoltage = latestSystem5VVoltage;
+    record.systemCurrent = latestSystemCurrent;
+  }
+  if (distanceValid) {
+    record.flags |= tide::RECORD_DISTANCE_VALID;
+    record.distanceMm = latestDistanceMm;
+    record.waterLevelMm = latestWaterLevelMm;
+  }
+  if (sht40Valid) {
+    record.flags |= tide::RECORD_SHT40_VALID;
+    record.temperatureC = latestTemperatureC;
+    record.humidityPercent = latestHumidityPercent;
+  }
+
+  record.timestampMs = estimateCurrentCycleTimestampMs();
+  if (record.timestampMs != 0) {
+    record.flags |= tide::RECORD_TIME_VALID;
+  }
+  record.distanceMadMm =
+      isnan(latestDistanceMadMm) ? 0.0f : latestDistanceMadMm;
+  record.acquisitionDurationMs = latestAcquisitionDurationMs;
+  record.acquiredSamples = a02AcquiredSamples;
+  record.usedSamples = a02UsedSamples;
+  record.outlierSamples = a02OutlierSamples;
+  record.quality = static_cast<uint8_t>(measurementQuality);
+  return record;
+}
+
+void persistCurrentMeasurement() {
+  if (currentCycleRecordReady) {
+    return;
+  }
+
+  currentCycleRecord = buildCurrentMeasurementRecord();
+  currentCycleRecordReady = true;
+  if (offlineQueue.ready() && offlineQueue.enqueue(currentCycleRecord)) {
+    currentCycleRecordQueued = true;
+    currentCycleSequence = currentCycleRecord.sequence;
+    Serial.printf("Record #%lu disimpan; antrean offline %lu/%lu.\n",
+                  static_cast<unsigned long>(currentCycleSequence),
+                  static_cast<unsigned long>(offlineQueue.count()),
+                  static_cast<unsigned long>(offlineQueue.capacity()));
+  } else {
+    tide::OfflineQueue::finalizeRecord(currentCycleRecord);
+    Serial.println("PERINGATAN: record hanya tersedia di RAM; LittleFS gagal.");
+  }
+}
+
+void retryPersistCurrentMeasurement() {
+  if (!currentCycleRecordReady || currentCycleRecordQueued ||
+      !offlineQueue.ready()) {
+    return;
+  }
+
+  tide::MeasurementRecord retryRecord = currentCycleRecord;
+  if (offlineQueue.enqueue(retryRecord)) {
+    currentCycleRecord = retryRecord;
+    currentCycleRecordQueued = true;
+    currentCycleSequence = retryRecord.sequence;
+    Serial.printf("Retry penyimpanan record #%lu berhasil; antrean=%lu.\n",
+                  static_cast<unsigned long>(currentCycleSequence),
+                  static_cast<unsigned long>(offlineQueue.count()));
+  }
+}
+
+void updateCurrentRecordTimestampIfPossible() {
+  if (!currentCycleRecordReady ||
+      (currentCycleRecord.flags & tide::RECORD_TIME_VALID) != 0) {
+    return;
+  }
+
+  const uint64_t timestampMs = estimateCurrentCycleTimestampMs();
+  if (timestampMs == 0) {
+    return;
+  }
+
+  currentCycleRecord.timestampMs = timestampMs;
+  currentCycleRecord.flags |= tide::RECORD_TIME_VALID;
+  tide::OfflineQueue::finalizeRecord(currentCycleRecord);
+  if (currentCycleRecordQueued &&
+      !offlineQueue.updateNewestTimestamp(currentCycleSequence, timestampMs)) {
+    Serial.println("PERINGATAN: timestamp record terbaru gagal diperbarui.");
+  } else {
+    Serial.printf("Timestamp record #%lu diperbarui setelah sinkronisasi NTP.\n",
+                  static_cast<unsigned long>(currentCycleSequence));
+  }
+}
+
+void sendRecordToBlynk(const tide::MeasurementRecord &record) {
   if (!Blynk.connected()) {
     return;
   }
 
-  if (batteryValid) {
-    Blynk.virtualWrite(V0, latestBatteryVoltage);
-  }
-  if (solarVoltageValid) {
-    Blynk.virtualWrite(V5, latestSolarVoltage);
-  }
-  if (system5VVoltageValid) {
-    Blynk.virtualWrite(V3, latestSystem5VVoltage);
-    Blynk.virtualWrite(V4, latestSystemCurrent);
-  }
-  if (distanceValid) {
-    Blynk.virtualWrite(V1, latestDistanceMm);
-    Blynk.virtualWrite(V2, latestWaterLevelMm / 1000.0f);
-  }
-  if (sht40Valid) {
-    Blynk.virtualWrite(V7, latestTemperatureC);
-    Blynk.virtualWrite(V8, latestHumidityPercent);
+  if ((record.flags & tide::RECORD_TIME_VALID) != 0) {
+    Blynk.beginGroup(record.timestampMs);
+  } else {
+    // Blynk menggunakan waktu server. Nilai tetap terselamatkan, tetapi waktu
+    // asli tidak dapat direkonstruksi setelah cold boot offline tanpa RTC.
+    Blynk.beginGroup();
   }
 
-  Blynk.virtualWrite(V11, static_cast<uint8_t>(measurementQuality));
-  Blynk.virtualWrite(V12, a02AcquiredSamples);
-  Blynk.virtualWrite(V13, a02UsedSamples);
-  Blynk.virtualWrite(V14, a02OutlierSamples);
-  Blynk.virtualWrite(V15,
-                     isnan(latestDistanceMadMm) ? 0.0f
-                                                : latestDistanceMadMm);
-  Blynk.virtualWrite(V16, latestAcquisitionDurationMs);
+  if ((record.flags & tide::RECORD_BATTERY_VALID) != 0) {
+    Blynk.virtualWrite(V0, record.batteryVoltage);
+  }
+  if ((record.flags & tide::RECORD_SOLAR_VALID) != 0) {
+    Blynk.virtualWrite(V5, record.solarVoltage);
+  }
+  if ((record.flags & tide::RECORD_SYSTEM_VALID) != 0) {
+    Blynk.virtualWrite(V3, record.systemVoltage);
+    Blynk.virtualWrite(V4, record.systemCurrent);
+  }
+  if ((record.flags & tide::RECORD_DISTANCE_VALID) != 0) {
+    Blynk.virtualWrite(V1, record.distanceMm);
+    Blynk.virtualWrite(V2, record.waterLevelMm / 1000.0f);
+  }
+  if ((record.flags & tide::RECORD_SHT40_VALID) != 0) {
+    Blynk.virtualWrite(V7, record.temperatureC);
+    Blynk.virtualWrite(V8, record.humidityPercent);
+  }
+
+  Blynk.virtualWrite(V11, record.quality);
+  Blynk.virtualWrite(V12, record.acquiredSamples);
+  Blynk.virtualWrite(V13, record.usedSamples);
+  Blynk.virtualWrite(V14, record.outlierSamples);
+  Blynk.virtualWrite(V15, record.distanceMadMm);
+  Blynk.virtualWrite(V16, record.acquisitionDurationMs);
+  Blynk.virtualWrite(V21, record.sequence);
+  Blynk.endGroup();
+}
+
+void publishOfflineQueueDiagnostics() {
+  if (!Blynk.connected()) {
+    return;
+  }
+  const int32_t pendingRecords =
+      offlineQueue.ready() ? static_cast<int32_t>(offlineQueue.count()) : -1;
+  const int32_t droppedRecords =
+      offlineQueue.ready()
+          ? static_cast<int32_t>(min(offlineQueue.droppedRecords(),
+                                     static_cast<uint32_t>(INT32_MAX)))
+          : -1;
+  Blynk.virtualWrite(V19, pendingRecords);
+  Blynk.virtualWrite(V20, droppedRecords);
+}
+
+uint8_t recordUploadLimitForCurrentCycle() {
+  // Dua record hanya pada setiap dua slot UTC. Rata-rata 1,5 record/siklus
+  // memberi ruang terhadap batas datapoint harian sambil menguras backlog.
+  return cycleAbsoluteSlotValid && (cycleAbsoluteSlot % 2ULL) == 0
+             ? MAX_RECORD_UPLOADS_PER_CYCLE
+             : 1;
+}
+
+void finishUploadWorkForCycle(const char *reason) {
+  if (cycleUploaded) {
+    return;
+  }
+  cycleUploaded = true;
+  cycleUploadedAt = millis();
+  publishOfflineQueueDiagnostics();
+  Serial.printf("Upload siklus selesai (%s); %u record dikonfirmasi, "
+                "antrean tersisa %lu; jendela OTA %lu ms.\n",
+                reason, recordsUploadedThisCycle,
+                static_cast<unsigned long>(offlineQueue.ready()
+                                               ? offlineQueue.count()
+                                               : 0),
+                static_cast<unsigned long>(OTA_LISTEN_WINDOW_MS));
+}
+
+void beginOfflineRecordUpload(const tide::MeasurementRecord &record) {
+  pendingUploadSequence = record.sequence;
+  pendingUploadAcknowledged = false;
+  sendRecordToBlynk(record);
+  offlineUploadState = OfflineUploadState::WAITING_TO_REQUEST_ACK;
+  uploadStateChangedAt = millis();
+
+  Serial.printf("Record #%lu dikirim dengan timestamp %s; menunggu ACK V21.\n",
+                static_cast<unsigned long>(record.sequence),
+                (record.flags & tide::RECORD_TIME_VALID) != 0 ? "asli"
+                                                               : "server");
+}
+
+void serviceOfflineUpload() {
+  if (cycleUploaded || !Blynk.connected() || !currentCycleRecordReady) {
+    return;
+  }
+
+  retryPersistCurrentMeasurement();
+  updateCurrentRecordTimestampIfPossible();
+
+  if (!offlineQueue.ready() || !currentCycleRecordQueued) {
+    sendRecordToBlynk(currentCycleRecord);
+    finishUploadWorkForCycle("record RAM dikirim best effort");
+    return;
+  }
+
+  if (offlineUploadState == OfflineUploadState::WAITING_TO_REQUEST_ACK) {
+    if (millis() - uploadStateChangedAt >= UPLOAD_ACK_REQUEST_DELAY_MS) {
+      v21SyncReceived = false;
+      Blynk.syncVirtual(V21);
+      offlineUploadState = OfflineUploadState::WAITING_FOR_ACK;
+      uploadStateChangedAt = millis();
+    }
+    return;
+  }
+
+  if (offlineUploadState == OfflineUploadState::WAITING_FOR_ACK) {
+    if (pendingUploadAcknowledged && v21SyncReceived) {
+      if (!offlineQueue.pop(pendingUploadSequence)) {
+        Serial.printf("ERROR: ACK record #%lu diterima tetapi antrean gagal "
+                      "diperbarui. Record dipertahankan.\n",
+                      static_cast<unsigned long>(pendingUploadSequence));
+        offlineUploadState = OfflineUploadState::IDLE;
+        finishUploadWorkForCycle("gagal memperbarui antrean");
+        return;
+      }
+
+      Serial.printf("ACK record #%lu diterima; record dihapus dari antrean.\n",
+                    static_cast<unsigned long>(pendingUploadSequence));
+      ++recordsUploadedThisCycle;
+      pendingUploadSequence = 0;
+      pendingUploadAcknowledged = false;
+      offlineUploadState = OfflineUploadState::IDLE;
+
+      if (offlineQueue.count() == 0) {
+        finishUploadWorkForCycle("antrean kosong");
+      } else if (recordsUploadedThisCycle >=
+                 recordUploadLimitForCurrentCycle()) {
+        finishUploadWorkForCycle("batas replay per siklus tercapai");
+      }
+      return;
+    }
+
+    if (millis() - uploadStateChangedAt >= UPLOAD_ACK_TIMEOUT_MS) {
+      Serial.printf("ACK V21 untuk record #%lu timeout; record tetap disimpan.\n",
+                    static_cast<unsigned long>(pendingUploadSequence));
+      offlineUploadState = OfflineUploadState::IDLE;
+      pendingUploadSequence = 0;
+      pendingUploadAcknowledged = false;
+      finishUploadWorkForCycle("ACK timeout");
+    }
+    return;
+  }
+
+  if (recordsUploadedThisCycle >= recordUploadLimitForCurrentCycle()) {
+    finishUploadWorkForCycle("batas replay per siklus tercapai");
+    return;
+  }
+
+  tide::MeasurementRecord record = {};
+  if (!offlineQueue.peek(record)) {
+    if (offlineQueue.count() == 0) {
+      finishUploadWorkForCycle("antrean kosong");
+    } else if (offlineQueue.discardCorruptHead()) {
+      Serial.println("Record head rusak dibuang; mencoba record berikutnya.");
+    } else {
+      Serial.println("ERROR: head antrean offline rusak/tidak dapat dibaca.");
+      finishUploadWorkForCycle("antrean tidak dapat dibaca");
+    }
+    return;
+  }
+  beginOfflineRecordUpload(record);
 }
 
 uint8_t sht40Crc(const uint8_t *data, size_t length) {
@@ -612,9 +894,18 @@ void startNormalMeasurementCycle() {
   normalCycleStarted = true;
   cycleAbsoluteSlotValid = false;
   captureCurrentAbsoluteSlot();
+  cycleStartedWithAbsoluteTime = cycleAbsoluteSlotValid;
   automaticMeasurementComplete = false;
   otherMeasurementsComplete = false;
   cycleUploaded = false;
+  currentCycleRecord = {};
+  currentCycleRecordReady = false;
+  currentCycleRecordQueued = false;
+  currentCycleSequence = 0;
+  recordsUploadedThisCycle = 0;
+  pendingUploadSequence = 0;
+  pendingUploadAcknowledged = false;
+  offlineUploadState = OfflineUploadState::IDLE;
   edgentConnectTimeoutArmed = false;
   edgentConnectTimedOut = false;
   provisioningRequested = false;
@@ -739,6 +1030,7 @@ void performOtherCycleMeasurements() {
   } else {
     Serial.println("SHT40: ERROR");
   }
+  persistCurrentMeasurement();
 }
 
 bool edgentIsConfigured() {
@@ -818,6 +1110,7 @@ void enterTimedDeepSleep() {
     return;
   }
 
+  retryPersistCurrentMeasurement();
   setA02YYUWPower(false);
   const uint32_t activeDurationMs = millis() - cycleStartedAt;
   uint64_t sleepDurationUs = 0;
@@ -868,9 +1161,11 @@ BLYNK_CONNECTED() {
   serviceNetworkTime();
   v6SyncReceived = false;
   v17SyncReceived = false;
-  // Ambil nilai terakhir V6 dan V17 yang tersimpan di Blynk Cloud.
+  v21SyncReceived = false;
+  // Ambil konfigurasi serta sequence ACK terakhir yang tersimpan di cloud.
   Blynk.syncVirtual(V6);
   Blynk.syncVirtual(V17);
+  Blynk.syncVirtual(V21);
   // Kondisi fisik saat ini menjadi nilai awal switch V9.
   Blynk.virtualWrite(V9, a02yyuwPowerEnabled ? 1 : 0);
   // Informasikan nama access point yang sedang dipakai tanpa mengirim password.
@@ -898,6 +1193,18 @@ BLYNK_WRITE(V17) {
   setDeepSleepDisabled(requestedState == 1);
 }
 
+BLYNK_WRITE(V21) {
+  const int32_t cloudSequence = param.asLong();
+  v21SyncReceived = true;
+  lastCloudSequence = cloudSequence > 0
+                          ? static_cast<uint32_t>(cloudSequence)
+                          : 0;
+  if (offlineUploadState == OfflineUploadState::WAITING_FOR_ACK &&
+      lastCloudSequence == pendingUploadSequence) {
+    pendingUploadAcknowledged = true;
+  }
+}
+
 BLYNK_WRITE(V6) {
   const float requestedHeightM = param.asFloat();
 
@@ -920,6 +1227,15 @@ BLYNK_WRITE(V6) {
   if (distanceValid) {
     latestWaterLevelMm =
         static_cast<int32_t>(sensorHeightMm) - latestDistanceMm;
+    if (currentCycleRecordReady &&
+        (currentCycleRecord.flags & tide::RECORD_DISTANCE_VALID) != 0) {
+      currentCycleRecord.waterLevelMm = latestWaterLevelMm;
+      tide::OfflineQueue::finalizeRecord(currentCycleRecord);
+      if (currentCycleRecordQueued &&
+          !offlineQueue.replaceNewest(currentCycleRecord)) {
+        Serial.println("PERINGATAN: koreksi datum record terbaru gagal disimpan.");
+      }
+    }
     if (cycleUploaded && Blynk.connected()) {
       // Koreksi V2 apabila balasan sync V6 datang setelah fallback upload.
       Blynk.virtualWrite(V2, latestWaterLevelMm / 1000.0f);
@@ -957,6 +1273,15 @@ void setup() {
               storedSensorHeightMm <= maximumSensorHeightMm
           ? storedSensorHeightMm
           : DEFAULT_SENSOR_HEIGHT_MM;
+
+  if (offlineQueue.begin()) {
+    Serial.printf("LittleFS siap: antrean offline %lu/%lu, dropped=%lu.\n",
+                  static_cast<unsigned long>(offlineQueue.count()),
+                  static_cast<unsigned long>(offlineQueue.capacity()),
+                  static_cast<unsigned long>(offlineQueue.droppedRecords()));
+  } else {
+    Serial.println("ERROR: LittleFS gagal; backup offline tidak tersedia.");
+  }
 
   BlynkEdgent.begin();
   edgentConfiguredAtBoot = edgentIsConfigured();
@@ -1152,11 +1477,7 @@ void loop() {
     // fallback apabila salah satu Datastream belum dibuat/tidak merespons.
     if ((v6SyncReceived && v17SyncReceived) ||
         millis() - blynkConnectedAt >= BLYNK_SYNC_FALLBACK_MS) {
-      uploadToBlynk();
-      cycleUploaded = true;
-      cycleUploadedAt = millis();
-      Serial.printf("Data siklus terkirim; membuka jendela OTA %lu ms.\n",
-                    static_cast<unsigned long>(OTA_LISTEN_WINDOW_MS));
+      serviceOfflineUpload();
     }
   }
 }

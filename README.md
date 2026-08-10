@@ -18,6 +18,10 @@ Monitor dan dikirim ke dashboard Blynk melalui Wi-Fi.
   absolut 5 menit (`00`, `05`, `10`, dan seterusnya).
 - Menggunakan interval relatif 5 menit sebagai fallback apabila waktu UTC belum
   tersedia.
+- Menyimpan maksimal 8.064 record (28 hari) pada ring buffer LittleFS sebelum
+  mencoba upload ke cloud.
+- Mengirim ulang backlog dengan timestamp asli dan menghapus record hanya setelah
+  sequence V21 terkonfirmasi dari Blynk.
 - Mengelola provisioning Wi-Fi, koneksi cloud, dan OTA melalui Blynk.Edgent.
 - Membatasi koneksi siklus normal selama 15 detik dan menyediakan jendela OTA
   15 detik setelah upload.
@@ -154,6 +158,9 @@ setiap hasil pembacaan.
 | V16 | Acquisition Duration | Integer | ms | Waktu pengumpulan sampel A02YYUW setelah warm-up hingga selesai atau timeout. |
 | V17 | Stay Awake | Integer | 0/1 | `0` memakai deep sleep normal; `1` membuat perangkat tetap terbangun. |
 | V18 | Connected SSID | String | - | Nama jaringan Wi-Fi yang sedang digunakan perangkat; password tidak dikirim. |
+| V19 | Pending Offline Records | Integer | count | Jumlah record yang masih menunggu konfirmasi upload; `-1` berarti LittleFS gagal. |
+| V20 | Dropped Offline Records | Integer | count | Akumulasi record rusak atau record tertua yang dibuang ketika antrean penuh. |
+| V21 | Last Uploaded Sequence | Integer | count | Sequence internal untuk memastikan record sudah diterima cloud sebelum dihapus. |
 
 Atur rentang minimum dan maksimum setiap Datastream sesuai kondisi instalasi.
 Tambahkan widget Gauge, Value Display, atau Chart pada dashboard dan hubungkan
@@ -175,6 +182,12 @@ Untuk V18, buat Datastream String dan hubungkan ke widget Label atau Value
 Display. Firmware memperbarui V18 setiap kali berhasil tersambung ke Blynk agar
 dashboard menunjukkan SSID aktif. Hanya nama SSID yang dikirim; password dan
 BSSID tidak dikirim.
+
+Untuk V19, gunakan rentang `-1` sampai `8064`. Untuk V20 dan V21, gunakan rentang
+`0` sampai `2147483647`. Aktifkan **Sync with latest server value** pada V21.
+V21 wajib tersedia karena firmware menyinkronkannya kembali sebagai acknowledgement
+setelah setiap upload. V19 dan V20 dapat ditampilkan menggunakan Value Display;
+V21 boleh disembunyikan dari dashboard pengguna.
 
 Arti V11:
 
@@ -232,15 +245,18 @@ Urutan normal setiap lima menit:
 3. Buang 5 frame awal, kumpulkan maksimal 50 sampel, lalu lakukan filtering.
 4. Tetapkan D0 LOW dan tahan pin LOW selama deep sleep.
 5. Baca SHT40 serta seluruh pengukuran INA3221 yang digunakan firmware.
-6. Jalankan Blynk.Edgent dengan batas koneksi total 15 detik.
-7. Setelah Wi-Fi tersambung, mulai sinkronisasi waktu UTC melalui NTP tanpa
+6. Simpan record bertimestamp ke ring buffer LittleFS sebelum mencoba internet.
+7. Jalankan Blynk.Edgent dengan batas koneksi total 15 detik.
+8. Setelah Wi-Fi tersambung, mulai sinkronisasi waktu UTC melalui NTP tanpa
    menghentikan proses Edgent.
-8. Setelah tersambung ke Blynk, kirim data segera setelah callback sync V6 dan
+9. Setelah tersambung ke Blynk, kirim data setelah callback sync V6 dan
    V17 diterima.
    Jika Blynk tidak mengirim nilai tersimpan, gunakan tinggi NVS setelah fallback
    3 detik, tanpa melewati deadline koneksi/upload 15 detik.
-9. Tetap online selama 15 detik sebagai jendela penerimaan Blynk.Air OTA.
-10. Jika waktu UTC valid, deep sleep sampai batas absolut lima menit berikutnya.
+10. Sinkronkan V21 dan hapus record hanya jika sequence yang diterima sama dengan
+    sequence yang baru dikirim.
+11. Tetap online selama 15 detik sebagai jendela penerimaan Blynk.Air OTA.
+12. Jika waktu UTC valid, deep sleep sampai batas absolut lima menit berikutnya.
     Jika waktu belum valid, gunakan sisa interval relatif lima menit.
 
 Jika V17 bernilai `1`, langkah deep sleep dilewati. Perangkat tetap melayani
@@ -251,7 +267,7 @@ selesai.
 
 ### Waktu NTP dan jadwal absolut
 
-Firmware versi `1.2.0` menggunakan UTC agar jadwal tidak dipengaruhi zona waktu
+Firmware sejak versi `1.2.0` menggunakan UTC agar jadwal tidak dipengaruhi zona waktu
 atau perubahan konfigurasi lokal. Server yang dicoba adalah `pool.ntp.org`,
 `time.google.com`, dan `time.cloudflare.com`. Permintaan NTP berjalan setelah
 Wi-Fi tersambung dan tidak menambah proses blocking baru ke siklus Edgent.
@@ -264,8 +280,47 @@ memulai sinkronisasi NTP kembali untuk mengoreksi drift.
 Jika NTP belum tersedia, perangkat tetap mengukur dan tidur memakai interval
 relatif sehingga kegagalan server waktu tidak menghentikan stasiun. Setelah mati
 daya penuh tanpa koneksi internet, timestamp absolut tidak dapat dipastikan
-sampai NTP berhasil kembali. Penyimpanan data offline bertimestamp belum termasuk
-dalam versi ini dan akan menjadi tahap terpisah.
+sampai NTP berhasil kembali.
+
+### Buffer offline bertimestamp
+
+Firmware `1.3.0` menyimpan setiap hasil pengukuran sebagai record biner 66 byte
+dengan checksum. Ring buffer berkapasitas 8.064 record, setara 28 hari pada
+interval lima menit, dan menggunakan sekitar 520 KiB dari partisi filesystem
+1,5 MiB. Dua salinan metadata dipakai bergantian agar metadata sebelumnya tetap
+tersedia jika daya terputus saat penulisan.
+
+Saat Blynk tersambung, record paling lama dikirim menggunakan
+`Blynk.beginGroup(timestamp)` sehingga V0–V16 yang relevan dan V21 mempunyai
+timestamp pengukuran yang sama. Firmware kemudian meminta kembali V21. Record
+hanya dikeluarkan dari LittleFS jika sequence yang diterima sama dengan record
+yang sedang menunggu ACK. Timeout atau koneksi terputus membuat record tetap
+tersimpan untuk siklus berikutnya.
+
+Untuk memberi ruang terhadap batas datapoint harian Blynk, firmware mengirim satu
+record pada satu slot dan maksimal dua record pada slot UTC berikutnya. Rata-rata
+maksimum adalah 1,5 record per siklus, sehingga backlog berkurang bertahap ketika
+koneksi pulih. Ketika kapasitas penuh, record tertua dibuang dan penghitung V20
+bertambah.
+
+Record yang dibuat setelah UTC tersedia mempertahankan timestamp asli. Record
+yang dibuat setelah cold boot tanpa NTP tetap disimpan, tetapi ketika diunggah
+akan memakai waktu server karena waktu absolut aslinya tidak dapat dipastikan
+tanpa RTC eksternal.
+
+Pengujian buffer offline yang disarankan:
+
+1. Buat V19, V20, dan V21 sesuai tabel, kemudian upload firmware melalui USB.
+2. Jalankan satu siklus online dan pastikan log ACK V21 muncul serta V19 kembali
+   ke `0`.
+3. Matikan access point selama minimal tiga siklus. Record harus tetap bertambah
+   di LittleFS walaupun dashboard tidak dapat diperbarui saat offline.
+4. Hidupkan access point dan pastikan V19 menampilkan backlog, lalu berkurang
+   bertahap pada siklus berikutnya.
+5. Periksa chart V1/V2: record replay yang memiliki UTC valid harus muncul pada
+   waktu pengukurannya, bukan pada waktu Wi-Fi tersambung kembali.
+6. Ulangi dengan reset perangkat ketika offline untuk memastikan antrean tetap
+   tersedia setelah boot.
 
 Provisioning pertama merupakan pengecualian: perangkat tetap terjaga dan sensor
 tetap OFF sampai konfigurasi Edgent berhasil. Timeout koneksi hanya berlaku pada
@@ -362,9 +417,12 @@ Solar CH1: 18.400 V
 Baterai CH2: 4.012 V
 Sistem CH3: 5.016 V, 0.350 A
 SHT40: 28.50 C, 76.20 %RH
+Record #125 disimpan; antrean offline 4/8064.
 Sinkronisasi waktu UTC melalui NTP dimulai.
 Waktu UTC tersedia: 2026-08-07 12:04:27 UTC.
-Data siklus terkirim; membuka jendela OTA 15000 ms.
+Record #122 dikirim dengan timestamp asli; menunggu ACK V21.
+ACK record #122 diterima; record dihapus dari antrean.
+Upload siklus selesai (batas replay per siklus tercapai); 1 record dikonfirmasi, antrean tersisa 3; jendela OTA 15000 ms.
 Siklus selesai dalam 38000 ms; deep sleep 18000 ms; bangun pada 2026-08-07 12:05:00 UTC.
 ```
 
@@ -394,6 +452,13 @@ Siklus selesai dalam 38000 ms; deep sleep 18000 ms; bangun pada 2026-08-07 12:05
 - **NTP belum memberikan waktu:** pastikan DNS dan UDP port 123 tidak diblokir
   jaringan. Firmware tetap berjalan dengan jadwal relatif dan mencoba NTP lagi
   setelah boot/deep sleep berikutnya.
+- **ACK V21 selalu timeout:** buat Datastream Integer V21, aktifkan penyimpanan
+  nilai terakhir/**Sync with latest server value**, lalu pastikan rentangnya dapat
+  menerima sequence positif. Record tidak dihapus selama ACK belum cocok.
+- **V19 bernilai -1:** LittleFS gagal dimount atau ditulis. Jangan mengandalkan
+  backup offline sampai masalah partisi/filesystem diperbaiki.
+- **V20 terus bertambah:** antrean penuh atau ditemukan record dengan checksum
+  rusak. Periksa lama gangguan internet dan kesehatan flash.
 - **Perangkat tidak masuk deep sleep:** pastikan switch V17 bernilai `0`.
 - **OTA belum mulai:** shipment Blynk.Air dapat menunggu hingga perangkat bangun
   pada siklus berikutnya. Pastikan perangkat sempat online dan jangan memutus
@@ -403,6 +468,7 @@ Siklus selesai dalam 38000 ms; deep sleep 18000 ms; bangun pada 2026-08-07 12:05
 
 ```text
 include/secrets.h  Template ID dan Template Name Blynk
-src/main.cpp       Program utama
+src/OfflineQueue.* Ring buffer LittleFS, checksum record, dan metadata ganda
+src/main.cpp       Sensor, Blynk, OTA, NTP, antrean, dan deep sleep
 platformio.ini     Konfigurasi board dan library PlatformIO
 ```
