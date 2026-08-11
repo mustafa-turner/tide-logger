@@ -491,9 +491,9 @@ dan password Wi-Fi tidak ditambahkan ke source code.
 3. Isi alamat IP/DNS host tersebut pada `MQTT_HOST`. Jangan memakai `0.0.0.0`
    sebagai target dari ESP32; nilai itu hanya alamat bind pada server.
 4. Beri host dashboard DHCP reservation/alamat statis, atau pakai nama DNS
-   lokal yang stabil. `rtk-dashboard` tidak memiliki setting
-   `mqtt.advertisedHost`; `mqtt.host` adalah alamat bind server, bukan alamat
-   tujuan perangkat.
+   lokal yang stabil. Pada branch `dev`, `mqtt.advertisedHost` mengatur alamat
+   yang ditampilkan dashboard; `mqtt.host` tetap alamat bind server, bukan
+   alamat tujuan perangkat.
 5. Jangan menambahkan username/password MQTT. Broker bawaan dashboard menerima
    koneksi tanpa autentikasi.
 6. Batasi TCP 1883 pada LAN/VPN tepercaya. MQTT ini tanpa autentikasi dan tanpa
@@ -507,13 +507,23 @@ dan password Wi-Fi tidak ditambahkan ke source code.
    pio device monitor
    ```
 
-`TELEMETRY_BACKEND` menerima `BLYNK_ONLY` atau `MQTT_ONLY`.
-`BLYNK_ONLY` mempertahankan jalur V21 ACK yang lama. `MQTT_ONLY` baru menghapus
-record LittleFS setelah packet ID QoS 1 menerima PUBACK yang cocok. Nilai
-`BOTH` sengaja ditolak saat compile: format queue v1 belum memiliki bit ACK
-durable per tujuan, sehingga implementasi dual-delivery tanpa migrasi dapat
-kehilangan data setelah reset. Duplikasi replay boleh terjadi; record tanpa ACK
-tidak boleh hilang.
+`TELEMETRY_BACKEND` menerima `BLYNK_ONLY`, `MQTT_ONLY`, atau `BOTH`.
+`BLYNK_ONLY` memakai ACK sequence V21, sedangkan `MQTT_ONLY` memakai PUBACK QoS
+1. `BOTH` menyimpan cursor ACK Blynk dan MQTT secara terpisah pada metadata
+queue LittleFS yang redundant. Kedua tujuan dapat terus maju secara independen,
+tetapi record baru dihapus setelah kedua cursor melewati sequence tersebut. Jika
+perangkat reset atau deep sleep setelah satu ACK, tujuan yang sudah selesai
+melanjutkan dari cursor-nya dan tujuan yang tertinggal tetap mengejar backlog.
+
+Dual delivery tidak memakai dua filesystem dan tidak menggandakan record.
+Queue tetap berisi maksimum 8.064 record x 66 byte, dua header queue 32 byte,
+dan dua header cursor 24 byte: maksimum sekitar 532.336 byte. Metadata cursor
+disimpan dalam file kecil terpisah pada LittleFS yang sama, sehingga file queue
+lama tetap kompatibel dan ukuran per record tidak berubah. Jika salah satu
+tujuan offline terus-menerus,
+tujuan yang sehat tetap menerima data baru sementara backlog dipertahankan
+untuk tujuan yang gagal. Pada interval lima menit, queue mencapai kapasitas
+sekitar 28 hari sebelum kebijakan drop-oldest berlaku.
 
 Contoh konfigurasi dashboard:
 
@@ -588,8 +598,8 @@ Implementasi dashboard saat ini menerima object JSON pada topic apa pun. Topic
 `telemetry/tide_sensor/<device-id>` karena itu diterima, dan `device_id` di
 payload dipakai sebagai identitas utama. Field `water_level_m` juga membuat
 dashboard mengenali `device_type` sebagai `tide_sensor`; raw payload disimpan
-ke SQLite. Dashboard memakai waktu terima untuk kolom waktu database, sedangkan
-timestamp pengukuran asli tetap tersedia sebagai `measured_at_ms` di raw JSON.
+ke SQLite. Branch `dev` memakai `measured_at_ms` sebagai waktu sample database
+jika field itu tersedia; jika tidak, dashboard memakai waktu terima.
 
 Broker mengirim PUBACK QoS 1 hanya setelah state dashboard diperbarui dan
 logger selesai memproses payload. Ini cocok dengan aturan queue firmware:
@@ -609,7 +619,8 @@ Contoh log normal (tanpa password/token):
 MQTT siap: host=192.168.1.50 port=1883 device=tide-station-01 topic=telemetry/tide_sensor/tide-station-01 client=tide-tide-station-01-a1b2c3 qos=1 retain=false TLS=off auth=none.
 MQTT PUBLISH: topic=telemetry/tide_sensor/tide-station-01 packet=7 sequence=125 bytes=612.
 MQTT PUBACK: packet=7 sequence=125 result=match.
-MQTT PUBACK sequence=125 cocok; record dihapus, sisa=2.
+ACK MQTT sequence=125 tersimpan; menunggu tujuan lain.
+Semua tujuan ACK sequence=125; record dihapus, sisa=2.
 ```
 
 Jika koneksi gagal, periksa hal berikut:
@@ -642,6 +653,7 @@ include/device_config.h.example  Konfigurasi site/device tanpa secret
 include/secrets.h.example        Placeholder secret yang aman dilacak
 src/TelemetryPayload.*           Sanitasi ID dan serialisasi JSON bounded
 src/TelemetryDelivery.h          Transisi sequence/packet ID/PUBACK
+src/TelemetryDeliveryState.h     Bit ACK durable per tujuan
 src/MqttTelemetry.*              Koneksi, backoff, publish QoS 1, callback ACK
 src/main.cpp                     Orkestrasi Blynk/MQTT/queue/deep sleep
 ```

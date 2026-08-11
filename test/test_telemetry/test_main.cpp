@@ -8,6 +8,7 @@
 #endif
 
 #include "TelemetryDelivery.h"
+#include "TelemetryDeliveryState.h"
 #include "TelemetryPayload.h"
 
 using tide::MeasurementRecord;
@@ -127,6 +128,30 @@ void test_only_matching_puback_transitions_delivery() {
   TEST_ASSERT_FALSE(tracker.pending());
 }
 
+void test_dual_destination_cursors_advance_independently() {
+  uint32_t blynkCursor = 0;
+  uint32_t mqttCursor = 0;
+
+  TEST_ASSERT_TRUE(tide::telemetrySequenceAfter(125, blynkCursor));
+  TEST_ASSERT_TRUE(tide::telemetrySequenceAfter(125, mqttCursor));
+
+  mqttCursor = 125;
+  TEST_ASSERT_FALSE(tide::telemetrySequenceDelivered(125, blynkCursor));
+  TEST_ASSERT_TRUE(tide::telemetrySequenceDelivered(125, mqttCursor));
+  TEST_ASSERT_TRUE(tide::telemetrySequenceAfter(126, mqttCursor));
+
+  blynkCursor = 125;
+  TEST_ASSERT_TRUE(tide::telemetrySequenceDelivered(125, blynkCursor));
+  TEST_ASSERT_TRUE(tide::telemetrySequenceDelivered(125, mqttCursor));
+
+  TEST_ASSERT_TRUE(tide::telemetrySequenceAfter(1, UINT32_MAX));
+  TEST_ASSERT_TRUE(tide::telemetrySequenceDelivered(UINT32_MAX, UINT32_MAX));
+  TEST_ASSERT_EQUAL_UINT32(1,
+                           tide::telemetryPendingOffset(UINT32_MAX, UINT32_MAX));
+  TEST_ASSERT_EQUAL_UINT32(
+      3, tide::telemetryPendingOffset(UINT32_MAX - 1U, 1));
+}
+
 }  // namespace
 
 int runTelemetryTests() {
@@ -135,6 +160,7 @@ int runTelemetryTests() {
   RUN_TEST(test_complete_payload_uses_original_timestamp_and_canonical_fields);
   RUN_TEST(test_invalid_optional_values_are_omitted_but_diagnostics_remain);
   RUN_TEST(test_only_matching_puback_transitions_delivery);
+  RUN_TEST(test_dual_destination_cursors_advance_independently);
   return UNITY_END();
 }
 

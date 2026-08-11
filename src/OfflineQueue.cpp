@@ -6,9 +6,12 @@
 namespace tide {
 namespace {
 constexpr char QUEUE_FILE_PATH[] = "/measurements.bin";
-constexpr uint32_t QUEUE_HEADER_MAGIC = 0x54494445UL;  // TIDE
-constexpr uint32_t RECORD_MAGIC = 0x574C564CUL;        // WLVL
+constexpr char DELIVERY_FILE_PATH[] = "/delivery.bin";
+constexpr uint32_t QUEUE_HEADER_MAGIC = 0x54494445UL;     // TIDE
+constexpr uint32_t DELIVERY_HEADER_MAGIC = 0x444C5652UL;  // DLVR
+constexpr uint32_t RECORD_MAGIC = 0x574C564CUL;           // WLVL
 constexpr uint16_t QUEUE_SCHEMA_VERSION = 1;
+constexpr uint16_t DELIVERY_SCHEMA_VERSION = 1;
 constexpr uint16_t RECORD_SCHEMA_VERSION = 1;
 constexpr uint8_t HEADER_COPY_COUNT = 2;
 }  // namespace
@@ -39,6 +42,10 @@ bool OfflineQueue::isRecordValid(const MeasurementRecord &record) {
 uint32_t OfflineQueue::recordOffset(uint32_t index) {
   return HEADER_COPY_COUNT * sizeof(QueueHeader) +
          index * sizeof(MeasurementRecord);
+}
+
+uint32_t OfflineQueue::deliveryHeaderOffset(uint8_t index) {
+  return index * sizeof(DeliveryHeader);
 }
 
 bool OfflineQueue::headerIsValid(const QueueHeader &header) const {
@@ -84,6 +91,40 @@ bool OfflineQueue::initializeFile() {
   return true;
 }
 
+bool OfflineQueue::initializeDeliveryState() {
+  File file = LittleFS.open(DELIVERY_FILE_PATH, FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+
+  DeliveryHeader first = {};
+  first.magic = DELIVERY_HEADER_MAGIC;
+  first.schemaVersion = DELIVERY_SCHEMA_VERSION;
+  first.generation = 1;
+  first.checksum =
+      checksumBytes(&first, offsetof(DeliveryHeader, checksum));
+
+  DeliveryHeader second = first;
+  second.generation = 0;
+  second.checksum =
+      checksumBytes(&second, offsetof(DeliveryHeader, checksum));
+
+  const bool written =
+      file.write(reinterpret_cast<const uint8_t *>(&first), sizeof(first)) ==
+          sizeof(first) &&
+      file.write(reinterpret_cast<const uint8_t *>(&second), sizeof(second)) ==
+          sizeof(second);
+  file.flush();
+  file.close();
+  if (!written) {
+    return false;
+  }
+
+  delivery_ = first;
+  activeDeliveryHeaderIndex_ = 0;
+  return true;
+}
+
 bool OfflineQueue::loadHeader() {
   File file = LittleFS.open(QUEUE_FILE_PATH, FILE_READ);
   if (!file) {
@@ -116,6 +157,38 @@ bool OfflineQueue::loadHeader() {
   return true;
 }
 
+bool OfflineQueue::loadDeliveryState() {
+  File file = LittleFS.open(DELIVERY_FILE_PATH, FILE_READ);
+  if (!file) {
+    return false;
+  }
+
+  DeliveryHeader copies[HEADER_COPY_COUNT] = {};
+  bool valid[HEADER_COPY_COUNT] = {};
+  for (uint8_t i = 0; i < HEADER_COPY_COUNT; ++i) {
+    if (file.read(reinterpret_cast<uint8_t *>(&copies[i]),
+                  sizeof(DeliveryHeader)) == sizeof(DeliveryHeader)) {
+      valid[i] = deliveryHeaderIsValid(copies[i]);
+    }
+  }
+  file.close();
+
+  if (!valid[0] && !valid[1]) {
+    return false;
+  }
+
+  if (valid[0] && valid[1]) {
+    activeDeliveryHeaderIndex_ =
+        static_cast<int32_t>(copies[1].generation - copies[0].generation) > 0
+            ? 1
+            : 0;
+  } else {
+    activeDeliveryHeaderIndex_ = valid[1] ? 1 : 0;
+  }
+  delivery_ = copies[activeDeliveryHeaderIndex_];
+  return true;
+}
+
 bool OfflineQueue::saveHeader(QueueHeader nextHeader) {
   nextHeader.magic = QUEUE_HEADER_MAGIC;
   nextHeader.schemaVersion = QUEUE_SCHEMA_VERSION;
@@ -142,6 +215,35 @@ bool OfflineQueue::saveHeader(QueueHeader nextHeader) {
 
   header_ = nextHeader;
   activeHeaderIndex_ = targetHeaderIndex;
+  return true;
+}
+
+bool OfflineQueue::saveDeliveryState(DeliveryHeader nextHeader) {
+  nextHeader.magic = DELIVERY_HEADER_MAGIC;
+  nextHeader.schemaVersion = DELIVERY_SCHEMA_VERSION;
+  nextHeader.generation = delivery_.generation + 1;
+  nextHeader.checksum =
+      checksumBytes(&nextHeader, offsetof(DeliveryHeader, checksum));
+
+  const uint8_t targetHeaderIndex = 1U - activeDeliveryHeaderIndex_;
+  File file = LittleFS.open(DELIVERY_FILE_PATH, "r+");
+  if (!file ||
+      !file.seek(deliveryHeaderOffset(targetHeaderIndex), SeekSet)) {
+    if (file) file.close();
+    return false;
+  }
+
+  const bool written =
+      file.write(reinterpret_cast<const uint8_t *>(&nextHeader),
+                 sizeof(nextHeader)) == sizeof(nextHeader);
+  file.flush();
+  file.close();
+  if (!written) {
+    return false;
+  }
+
+  delivery_ = nextHeader;
+  activeDeliveryHeaderIndex_ = targetHeaderIndex;
   return true;
 }
 
@@ -189,19 +291,33 @@ bool OfflineQueue::begin() {
   if (!LittleFS.begin(true)) {
     return false;
   }
-  if (LittleFS.totalBytes() < recordOffset(OFFLINE_QUEUE_CAPACITY)) {
+  if (LittleFS.totalBytes() < recordOffset(OFFLINE_QUEUE_CAPACITY) +
+                                  HEADER_COPY_COUNT * sizeof(DeliveryHeader)) {
     return false;
   }
 
+  bool queueInitialized = false;
   if (!LittleFS.exists(QUEUE_FILE_PATH)) {
     if (!initializeFile()) {
       return false;
     }
+    queueInitialized = true;
   } else if (!loadHeader()) {
     LittleFS.remove(QUEUE_FILE_PATH);
     if (!initializeFile()) {
       return false;
     }
+    queueInitialized = true;
+  }
+
+  // The cursor file is independent from the v1 record layout. A newly created
+  // queue must never inherit cursors from an older queue file.
+  if (queueInitialized) {
+    LittleFS.remove(DELIVERY_FILE_PATH);
+  }
+  if ((queueInitialized || !loadDeliveryState()) &&
+      !initializeDeliveryState()) {
+    return false;
   }
 
   ready_ = true;
@@ -267,6 +383,150 @@ bool OfflineQueue::pop(uint32_t expectedSequence) {
   // meninggalkan data basi di luar rentang antrean dan tidak mengulang upload.
   clearRecord(previousHead);
   return true;
+}
+
+bool OfflineQueue::deliveryHeaderIsValid(
+    const DeliveryHeader &header) const {
+  return header.magic == DELIVERY_HEADER_MAGIC &&
+         header.schemaVersion == DELIVERY_SCHEMA_VERSION &&
+         header.checksum ==
+             checksumBytes(&header, offsetof(DeliveryHeader, checksum));
+}
+
+uint32_t OfflineQueue::deliveryCursor(
+    TelemetryDestination destination) const {
+  return destination == TelemetryDestination::BLYNK ? delivery_.blynkCursor
+                                                     : delivery_.mqttCursor;
+}
+
+bool OfflineQueue::peekPendingDelivery(TelemetryDestination destination,
+                                       MeasurementRecord &record,
+                                       bool &hasPending) {
+  hasPending = false;
+  if (!ready_ ||
+      (telemetryDestinationBit(destination) & TELEMETRY_DELIVERY_MASK) == 0) {
+    return false;
+  }
+
+  if (header_.count == 0) {
+    return true;
+  }
+
+  const uint32_t cursor = deliveryCursor(destination);
+  MeasurementRecord head = {};
+  if (!readRecord(header_.head, head)) {
+    return false;
+  }
+  if (telemetrySequenceAfter(head.sequence, cursor)) {
+    record = head;
+    hasPending = true;
+    return true;
+  }
+
+  // Records are contiguous except that sequence zero is deliberately skipped.
+  // Correct that one-value gap when this live range crosses UINT32_MAX -> 1.
+  const uint32_t offset = telemetryPendingOffset(head.sequence, cursor);
+  if (offset >= header_.count) {
+    return true;
+  }
+  const uint32_t index =
+      (header_.head + offset) % OFFLINE_QUEUE_CAPACITY;
+  MeasurementRecord candidate = {};
+  if (!readRecord(index, candidate) ||
+      !telemetrySequenceAfter(candidate.sequence, cursor)) {
+    return false;
+  }
+  record = candidate;
+  hasPending = true;
+  return true;
+}
+
+bool OfflineQueue::sequenceDeliveredToRequired(
+    uint32_t sequence, const DeliveryHeader &delivery,
+    uint16_t requiredMask) const {
+  if (requiredMask == 0 ||
+      (requiredMask & ~TELEMETRY_DELIVERY_MASK) != 0) {
+    return false;
+  }
+  if ((requiredMask & telemetryDestinationBit(TelemetryDestination::BLYNK)) !=
+          0 &&
+      !telemetrySequenceDelivered(sequence, delivery.blynkCursor)) {
+    return false;
+  }
+  if ((requiredMask & telemetryDestinationBit(TelemetryDestination::MQTT)) !=
+          0 &&
+      !telemetrySequenceDelivered(sequence, delivery.mqttCursor)) {
+    return false;
+  }
+  return true;
+}
+
+bool OfflineQueue::trimDeliveredRecords(uint16_t requiredMask,
+                                        uint32_t &removedRecords) {
+  removedRecords = 0;
+  while (header_.count > 0) {
+    MeasurementRecord head = {};
+    if (!readRecord(header_.head, head)) {
+      return false;
+    }
+    if (!sequenceDeliveredToRequired(head.sequence, delivery_, requiredMask)) {
+      return true;
+    }
+    if (!pop(head.sequence)) {
+      return false;
+    }
+    ++removedRecords;
+  }
+  return true;
+}
+
+bool OfflineQueue::reconcileDeliveries(uint16_t requiredMask,
+                                       uint32_t &removedRecords) {
+  if (!ready_) {
+    removedRecords = 0;
+    return false;
+  }
+  return trimDeliveredRecords(requiredMask, removedRecords);
+}
+
+DeliveryAcknowledgeResult OfflineQueue::acknowledgeDelivery(
+    uint32_t expectedSequence, TelemetryDestination destination,
+    uint16_t requiredMask) {
+  if (!ready_ || header_.count == 0 ||
+      (requiredMask & ~TELEMETRY_DELIVERY_MASK) != 0 || requiredMask == 0) {
+    return DeliveryAcknowledgeResult::ERROR;
+  }
+
+  const uint16_t destinationBit = telemetryDestinationBit(destination);
+  if ((requiredMask & destinationBit) == 0) {
+    return DeliveryAcknowledgeResult::ERROR;
+  }
+
+  MeasurementRecord pending = {};
+  bool hasPending = false;
+  if (!peekPendingDelivery(destination, pending, hasPending) || !hasPending ||
+      pending.sequence != expectedSequence) {
+    return DeliveryAcknowledgeResult::ERROR;
+  }
+
+  DeliveryHeader next = delivery_;
+  if (destination == TelemetryDestination::BLYNK) {
+    next.blynkCursor = expectedSequence;
+  } else {
+    next.mqttCursor = expectedSequence;
+  }
+  const bool recordComplete =
+      sequenceDeliveredToRequired(expectedSequence, next, requiredMask);
+  if (!saveDeliveryState(next)) {
+    return DeliveryAcknowledgeResult::ERROR;
+  }
+
+  uint32_t removedRecords = 0;
+  if (!trimDeliveredRecords(requiredMask, removedRecords)) {
+    return DeliveryAcknowledgeResult::ERROR;
+  }
+  return recordComplete ? DeliveryAcknowledgeResult::RECORD_COMPLETE
+                        : DeliveryAcknowledgeResult::RECORDED;
 }
 
 bool OfflineQueue::discardCorruptHead() {

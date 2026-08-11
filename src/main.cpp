@@ -160,6 +160,10 @@ namespace
   bool currentCycleRecordQueued = false;
   uint32_t currentCycleSequence = 0;
   uint8_t recordsUploadedThisCycle = 0;
+  uint8_t blynkRecordsAcknowledgedThisCycle = 0;
+  uint8_t mqttRecordsAcknowledgedThisCycle = 0;
+  bool blynkUploadFinishedForCycle = false;
+  bool mqttUploadFinishedForCycle = false;
   uint32_t pendingUploadSequence = 0;
   uint32_t uploadStateChangedAt = 0;
   uint32_t lastCloudSequence = 0;
@@ -609,6 +613,70 @@ namespace
                   static_cast<unsigned long>(OTA_LISTEN_WINDOW_MS));
   }
 
+  void finishDestinationUploadForCycle(
+      tide::TelemetryDestination destination, const char *reason)
+  {
+    bool &finished = destination == tide::TelemetryDestination::BLYNK
+                         ? blynkUploadFinishedForCycle
+                         : mqttUploadFinishedForCycle;
+    if (finished)
+    {
+      return;
+    }
+    finished = true;
+    Serial.printf("Upload %s selesai untuk siklus ini (%s).\n",
+                  destination == tide::TelemetryDestination::BLYNK ? "Blynk"
+                                                                   : "MQTT",
+                  reason);
+    if (blynkUploadFinishedForCycle && mqttUploadFinishedForCycle)
+    {
+      finishUploadWorkForCycle(reason);
+    }
+  }
+
+  void recordDurableDeliveryAcknowledgement(
+      uint32_t sequence, tide::TelemetryDestination destination,
+      const char *destinationName)
+  {
+    const tide::DeliveryAcknowledgeResult result =
+        offlineQueue.acknowledgeDelivery(
+            sequence, destination, telemetryRequiredDeliveryMask());
+    if (result == tide::DeliveryAcknowledgeResult::ERROR)
+    {
+      Serial.printf("ERROR: ACK %s sequence=%lu diterima tetapi status delivery "
+                    "antrean gagal disimpan; record dipertahankan.\n",
+                    destinationName, static_cast<unsigned long>(sequence));
+      finishDestinationUploadForCycle(
+          destination, "gagal menyimpan cursor ACK tujuan");
+      return;
+    }
+
+    uint8_t &destinationAcknowledged =
+        destination == tide::TelemetryDestination::BLYNK
+            ? blynkRecordsAcknowledgedThisCycle
+            : mqttRecordsAcknowledgedThisCycle;
+    ++destinationAcknowledged;
+
+    if (result == tide::DeliveryAcknowledgeResult::RECORDED)
+    {
+      Serial.printf("ACK %s sequence=%lu tersimpan; cursor tujuan maju.\n",
+                    destinationName, static_cast<unsigned long>(sequence));
+    }
+    else
+    {
+      ++recordsUploadedThisCycle;
+      Serial.printf("Semua tujuan ACK sequence=%lu; record dihapus, sisa=%lu.\n",
+                    static_cast<unsigned long>(sequence),
+                    static_cast<unsigned long>(offlineQueue.count()));
+    }
+
+    if (destinationAcknowledged >= recordUploadLimitForCurrentCycle())
+    {
+      finishDestinationUploadForCycle(destination,
+                                      "batas replay tujuan tercapai");
+    }
+  }
+
   void beginOfflineRecordUpload(const tide::MeasurementRecord &record)
   {
     pendingUploadSequence = record.sequence;
@@ -625,7 +693,8 @@ namespace
 
   void serviceOfflineUpload()
   {
-    if (cycleUploaded || !Blynk.connected() || !currentCycleRecordReady)
+    if (cycleUploaded || blynkUploadFinishedForCycle || !Blynk.connected() ||
+        !currentCycleRecordReady)
     {
       return;
     }
@@ -636,7 +705,9 @@ namespace
     if (!offlineQueue.ready() || !currentCycleRecordQueued)
     {
       sendRecordToBlynk(currentCycleRecord);
-      finishUploadWorkForCycle("record RAM dikirim best effort");
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::BLYNK,
+          "record RAM dikirim best effort");
       return;
     }
 
@@ -656,32 +727,13 @@ namespace
     {
       if (pendingUploadAcknowledged && v21SyncReceived)
       {
-        if (!offlineQueue.pop(pendingUploadSequence))
-        {
-          Serial.printf("ERROR: ACK record #%lu diterima tetapi antrean gagal "
-                        "diperbarui. Record dipertahankan.\n",
-                        static_cast<unsigned long>(pendingUploadSequence));
-          offlineUploadState = OfflineUploadState::IDLE;
-          finishUploadWorkForCycle("gagal memperbarui antrean");
-          return;
-        }
-
-        Serial.printf("ACK record #%lu diterima; record dihapus dari antrean.\n",
-                      static_cast<unsigned long>(pendingUploadSequence));
-        ++recordsUploadedThisCycle;
+        const uint32_t acknowledgedSequence = pendingUploadSequence;
         pendingUploadSequence = 0;
         pendingUploadAcknowledged = false;
         offlineUploadState = OfflineUploadState::IDLE;
-
-        if (offlineQueue.count() == 0)
-        {
-          finishUploadWorkForCycle("antrean kosong");
-        }
-        else if (recordsUploadedThisCycle >=
-                 recordUploadLimitForCurrentCycle())
-        {
-          finishUploadWorkForCycle("batas replay per siklus tercapai");
-        }
+        recordDurableDeliveryAcknowledgement(
+            acknowledgedSequence, tide::TelemetryDestination::BLYNK,
+            "Blynk");
         return;
       }
 
@@ -692,33 +744,36 @@ namespace
         offlineUploadState = OfflineUploadState::IDLE;
         pendingUploadSequence = 0;
         pendingUploadAcknowledged = false;
-        finishUploadWorkForCycle("ACK timeout");
+        finishDestinationUploadForCycle(tide::TelemetryDestination::BLYNK,
+                                        "ACK timeout");
       }
       return;
     }
 
-    if (recordsUploadedThisCycle >= recordUploadLimitForCurrentCycle())
+    if (blynkRecordsAcknowledgedThisCycle >=
+        recordUploadLimitForCurrentCycle())
     {
-      finishUploadWorkForCycle("batas replay per siklus tercapai");
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::BLYNK,
+          "batas replay Blynk per siklus tercapai");
       return;
     }
 
     tide::MeasurementRecord record = {};
-    if (!offlineQueue.peek(record))
+    bool hasPending = false;
+    if (!offlineQueue.peekPendingDelivery(
+            tide::TelemetryDestination::BLYNK, record, hasPending))
     {
-      if (offlineQueue.count() == 0)
-      {
-        finishUploadWorkForCycle("antrean kosong");
-      }
-      else if (offlineQueue.discardCorruptHead())
-      {
-        Serial.println("Record head rusak dibuang; mencoba record berikutnya.");
-      }
-      else
-      {
-        Serial.println("ERROR: head antrean offline rusak/tidak dapat dibaca.");
-        finishUploadWorkForCycle("antrean tidak dapat dibaca");
-      }
+      Serial.println("ERROR: antrean pending Blynk tidak dapat dibaca.");
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::BLYNK,
+          "antrean pending Blynk tidak dapat dibaca");
+      return;
+    }
+    if (!hasPending)
+    {
+      finishDestinationUploadForCycle(tide::TelemetryDestination::BLYNK,
+                                      "tidak ada record pending Blynk");
       return;
     }
     beginOfflineRecordUpload(record);
@@ -726,8 +781,8 @@ namespace
 
   void armMqttUploadDeadline()
   {
-    if (!telemetryUsesMqtt() || mqttUploadDeadlineArmed || cycleUploaded ||
-        !currentCycleRecordReady)
+    if (!telemetryUsesMqtt() || mqttUploadFinishedForCycle ||
+        mqttUploadDeadlineArmed || cycleUploaded || !currentCycleRecordReady)
     {
       return;
     }
@@ -766,7 +821,8 @@ namespace
 
   void serviceMqttOfflineUpload()
   {
-    if (!telemetryUsesMqtt() || cycleUploaded || !currentCycleRecordReady)
+    if (!telemetryUsesMqtt() || mqttUploadFinishedForCycle || cycleUploaded ||
+        !currentCycleRecordReady)
     {
       return;
     }
@@ -779,7 +835,9 @@ namespace
     {
       if (mqttUploadDeadlineExpired())
       {
-        finishUploadWorkForCycle("deadline MQTT; inisialisasi gagal");
+        finishDestinationUploadForCycle(
+            tide::TelemetryDestination::MQTT,
+            "deadline MQTT; inisialisasi gagal");
       }
       return;
     }
@@ -797,34 +855,16 @@ namespace
         }
         else
         {
-          ++recordsUploadedThisCycle;
-          finishUploadWorkForCycle("record RAM mendapat MQTT PUBACK");
+          ++mqttRecordsAcknowledgedThisCycle;
+          finishDestinationUploadForCycle(
+              tide::TelemetryDestination::MQTT,
+              "record RAM mendapat MQTT PUBACK");
         }
         return;
       }
 
-      if (!offlineQueue.pop(acknowledgedSequence))
-      {
-        Serial.printf("ERROR: MQTT PUBACK sequence=%lu diterima tetapi head "
-                      "antrean tidak cocok/gagal diperbarui; record disimpan.\n",
-                      static_cast<unsigned long>(acknowledgedSequence));
-        finishUploadWorkForCycle("gagal memperbarui antrean setelah PUBACK");
-        return;
-      }
-
-      ++recordsUploadedThisCycle;
-      Serial.printf("MQTT PUBACK sequence=%lu cocok; record dihapus, sisa=%lu.\n",
-                    static_cast<unsigned long>(acknowledgedSequence),
-                    static_cast<unsigned long>(offlineQueue.count()));
-      if (offlineQueue.count() == 0)
-      {
-        finishUploadWorkForCycle("antrean MQTT kosong");
-      }
-      else if (recordsUploadedThisCycle >=
-               recordUploadLimitForCurrentCycle())
-      {
-        finishUploadWorkForCycle("batas replay MQTT per siklus tercapai");
-      }
+      recordDurableDeliveryAcknowledgement(
+          acknowledgedSequence, tide::TelemetryDestination::MQTT, "MQTT");
       return;
     }
 
@@ -833,16 +873,21 @@ namespace
       Serial.printf("Deadline MQTT %lu ms habis; PUBACK tertunda dan record "
                     "tetap dalam antrean.\n",
                     static_cast<unsigned long>(MQTT_UPLOAD_DEADLINE_MS));
-      finishUploadWorkForCycle("deadline MQTT; record dipertahankan");
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::MQTT,
+          "deadline MQTT; record dipertahankan");
       return;
     }
 
     if (mqttTelemetry->awaitingPuback() || !mqttTelemetry->connected())
       return;
 
-    if (recordsUploadedThisCycle >= recordUploadLimitForCurrentCycle())
+    if (mqttRecordsAcknowledgedThisCycle >=
+        recordUploadLimitForCurrentCycle())
     {
-      finishUploadWorkForCycle("batas replay MQTT per siklus tercapai");
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::MQTT,
+          "batas replay MQTT per siklus tercapai");
       return;
     }
 
@@ -859,20 +904,19 @@ namespace
     }
 
     tide::MeasurementRecord record = {};
-    if (!offlineQueue.peek(record))
+    bool hasPending = false;
+    if (!offlineQueue.peekPendingDelivery(
+            tide::TelemetryDestination::MQTT, record, hasPending))
     {
-      if (offlineQueue.count() == 0)
-      {
-        finishUploadWorkForCycle("antrean MQTT kosong");
-      }
-      else if (offlineQueue.discardCorruptHead())
-      {
-        Serial.println("Record head MQTT rusak dibuang; mencoba berikutnya.");
-      }
-      else
-      {
-        finishUploadWorkForCycle("antrean MQTT tidak dapat dibaca");
-      }
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::MQTT,
+          "antrean pending MQTT tidak dapat dibaca");
+      return;
+    }
+    if (!hasPending)
+    {
+      finishDestinationUploadForCycle(tide::TelemetryDestination::MQTT,
+                                      "tidak ada record pending MQTT");
       return;
     }
     buildAndPublishMqttRecord(record);
@@ -1209,6 +1253,10 @@ namespace
     currentCycleRecordQueued = false;
     currentCycleSequence = 0;
     recordsUploadedThisCycle = 0;
+    blynkRecordsAcknowledgedThisCycle = 0;
+    mqttRecordsAcknowledgedThisCycle = 0;
+    blynkUploadFinishedForCycle = !telemetryUsesBlynk();
+    mqttUploadFinishedForCycle = !telemetryUsesMqtt();
     pendingUploadSequence = 0;
     pendingUploadAcknowledged = false;
     offlineUploadState = OfflineUploadState::IDLE;
@@ -1659,6 +1707,17 @@ void setup()
 
   if (offlineQueue.begin())
   {
+    uint32_t reconciledRecords = 0;
+    if (!offlineQueue.reconcileDeliveries(telemetryRequiredDeliveryMask(),
+                                          reconciledRecords))
+    {
+      Serial.println("ERROR: cursor delivery queue gagal direkonsiliasi.");
+    }
+    else if (reconciledRecords > 0)
+    {
+      Serial.printf("Cursor delivery memulihkan %lu record yang sudah lengkap.\n",
+                    static_cast<unsigned long>(reconciledRecords));
+    }
     Serial.printf("LittleFS siap: antrean offline %lu/%lu, dropped=%lu.\n",
                   static_cast<unsigned long>(offlineQueue.count()),
                   static_cast<unsigned long>(offlineQueue.capacity()),
