@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "MqttHostConfig.h"
 #include "MqttTelemetry.h"
 #include "OfflineQueue.h"
 #include "TelemetryBackend.h"
@@ -20,6 +21,7 @@
 #include <esp_sleep.h>
 #include <sys/time.h>
 #include <time.h>
+#include <cstdarg>
 #include <new>
 
 #if MQTT_USE_TLS != 0
@@ -71,6 +73,12 @@ namespace
   constexpr char NTP_SERVER_SECONDARY[] = "time.google.com";
   constexpr char NTP_SERVER_TERTIARY[] = "time.cloudflare.com";
   constexpr char STAY_AWAKE_KEY[] = "stay_awake";
+  constexpr char MQTT_HOST_KEY[] = "mqtt_host";
+  // Preserve support for a full DNS hostname in device_config.h, even though
+  // runtime changes from Blynk intentionally accept IPv4 addresses only.
+  constexpr size_t MQTT_HOST_CAPACITY = 256;
+  static_assert(sizeof(MQTT_HOST) <= MQTT_HOST_CAPACITY,
+                "MQTT_HOST is longer than a valid DNS hostname");
 
   // Jarak vertikal sensor ke titik nol/dasar pengukuran pasang surut.
   // Ubah nilai ini sesuai hasil pengukuran di lokasi pemasangan.
@@ -99,6 +107,7 @@ namespace
   bool a02yyuwWarmupComplete = false;
   uint32_t a02yyuwPowerOnAt = 0;
   Preferences appPreferences;
+  char activeMqttHost[MQTT_HOST_CAPACITY] = {};
 
   enum class MeasurementQuality : uint8_t
   {
@@ -375,6 +384,118 @@ namespace
     } else {
       Serial.println("Perintah: sensor on | sensor off | sensor status");
     } });
+  }
+
+  void loadMqttHostConfiguration()
+  {
+    snprintf(activeMqttHost, sizeof(activeMqttHost), "%s", MQTT_HOST);
+
+    const String storedHost = appPreferences.getString(MQTT_HOST_KEY, "");
+    if (storedHost.isEmpty())
+    {
+      return;
+    }
+
+    if (!tide::isValidMqttIpv4(storedHost.c_str()) ||
+        storedHost.length() >= sizeof(activeMqttHost))
+    {
+      Serial.println("MQTT host override di NVS tidak valid; memakai device_config.h.");
+      appPreferences.remove(MQTT_HOST_KEY);
+      return;
+    }
+
+    snprintf(activeMqttHost, sizeof(activeMqttHost), "%s", storedHost.c_str());
+  }
+
+  void blynkTerminalPrintf(const char *format, ...)
+  {
+    if (!Blynk.connected())
+    {
+      return;
+    }
+
+    char message[256] = {};
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    Blynk.virtualWrite(V10, message);
+  }
+
+  void showMqttTerminalHelp()
+  {
+    blynkTerminalPrintf(
+        "Commands:\nmqtt show\nmqtt set <IPv4>\nmqtt reset\nmqtt apply");
+  }
+
+  void handleMqttTerminalCommand(String command)
+  {
+    command.trim();
+    String normalized = command;
+    normalized.toLowerCase();
+
+    if (normalized.isEmpty() || normalized == "help")
+    {
+      showMqttTerminalHelp();
+      return;
+    }
+
+    if (normalized == "mqtt show")
+    {
+      const String storedHost = appPreferences.getString(MQTT_HOST_KEY, "");
+      const char *nextHost = storedHost.isEmpty() ? MQTT_HOST : storedHost.c_str();
+      blynkTerminalPrintf("Active: %s:%u\nNext boot: %s:%u", activeMqttHost,
+                          static_cast<unsigned>(MQTT_PORT), nextHost,
+                          static_cast<unsigned>(MQTT_PORT));
+      return;
+    }
+
+    if (normalized.startsWith("mqtt set "))
+    {
+      String requestedHost = command.substring(9);
+      requestedHost.trim();
+      if (!tide::isValidMqttIpv4(requestedHost.c_str()))
+      {
+        blynkTerminalPrintf("Rejected: enter one unicast IPv4 address, e.g. 192.168.1.50");
+        return;
+      }
+
+      const size_t storedLength =
+          appPreferences.putString(MQTT_HOST_KEY, requestedHost);
+      if (storedLength != requestedHost.length())
+      {
+        blynkTerminalPrintf("Error: MQTT IP was not saved");
+        return;
+      }
+
+      blynkTerminalPrintf("Saved %s:%u. Run 'mqtt apply' or wait for next wake.",
+                          requestedHost.c_str(),
+                          static_cast<unsigned>(MQTT_PORT));
+      return;
+    }
+
+    if (normalized == "mqtt reset")
+    {
+      if (!appPreferences.remove(MQTT_HOST_KEY) &&
+          appPreferences.isKey(MQTT_HOST_KEY))
+      {
+        blynkTerminalPrintf("Error: MQTT override was not removed");
+        return;
+      }
+      blynkTerminalPrintf("Reset saved. Next boot uses %s:%u.", MQTT_HOST,
+                          static_cast<unsigned>(MQTT_PORT));
+      return;
+    }
+
+    if (normalized == "mqtt apply")
+    {
+      blynkTerminalPrintf("Restarting; the saved MQTT IP will be applied.");
+      edgentTimer.setTimeout(1000L, []()
+                             { ESP.restart(); });
+      return;
+    }
+
+    blynkTerminalPrintf("Unknown command. Enter 'help'.");
   }
 
   uint64_t estimateCurrentCycleTimestampMs()
@@ -1600,6 +1721,11 @@ BLYNK_WRITE(V9)
   setA02YYUWPower(param.asInt() != 0);
 }
 
+BLYNK_WRITE(V10)
+{
+  handleMqttTerminalCommand(param.asStr());
+}
+
 BLYNK_WRITE(V17)
 {
   const int requestedState = param.asInt();
@@ -1692,6 +1818,7 @@ void setup()
   Serial1.begin(9600, SERIAL_8N1, A02YYUW_RX_PIN, A02YYUW_TX_PIN);
 
   appPreferences.begin("tidal", false);
+  loadMqttHostConfiguration();
   deepSleepDisabled = appPreferences.getBool(STAY_AWAKE_KEY, false);
   const uint32_t storedSensorHeightMm =
       appPreferences.getUInt("sensor_h_mm", DEFAULT_SENSOR_HEIGHT_MM);
@@ -1732,7 +1859,7 @@ void setup()
   {
     mqttTelemetry = new (std::nothrow) tide::MqttTelemetry();
     mqttInitialized = mqttTelemetry != nullptr && mqttTelemetry->begin(
-                                                      TIDE_DEVICE_ID, MQTT_HOST, MQTT_PORT, ESP.getEfuseMac());
+                                                      TIDE_DEVICE_ID, activeMqttHost, MQTT_PORT, ESP.getEfuseMac());
     if (!mqttInitialized)
     {
       Serial.println("ERROR MQTT: backend tetap bounded; record tidak akan "
@@ -1753,6 +1880,8 @@ void setup()
                 A02YYUW_POWER_PIN);
   Serial.println("Tes Serial: sensor on | sensor off | sensor status");
   Serial.println("Tes Blynk: switch V9 (0=OFF, 1=ON).");
+  Serial.printf("MQTT broker aktif: %s:%u\n", activeMqttHost,
+                static_cast<unsigned>(MQTT_PORT));
   Serial.printf("Tinggi referensi sensor awal: %lu mm\n",
                 static_cast<unsigned long>(sensorHeightMm));
   Serial.println("Provisioning Wi-Fi dan koneksi cloud dikelola Blynk.Edgent.");

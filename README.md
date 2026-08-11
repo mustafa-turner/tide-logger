@@ -149,7 +149,7 @@ setiap hasil pembacaan.
 | V7 | Suhu SHT40 | Double | °C | Suhu lingkungan hasil pengukuran SHT40. |
 | V8 | Kelembapan SHT40 | Double | %RH | Kelembapan relatif hasil pengukuran SHT40. |
 | V9 | A02YYUW Power | Integer | 0/1 | Status dan kontrol manual load switch A02YYUW selama perangkat terbangun. |
-| V10 | Dicadangkan untuk Terminal | String | - | Belum digunakan; disiapkan untuk terminal/konsol Blynk mendatang. |
+| V10 | MQTT Terminal | String | - | Terminal perintah untuk melihat, mengganti, dan menerapkan alamat IPv4 broker MQTT. |
 | V11 | Measurement Quality | Integer | 0/1/2 | Kualitas hasil A02YYUW: 0 INVALID, 1 POOR, atau 2 GOOD. |
 | V12 | Samples Acquired | Integer | count | Jumlah sampel A02YYUW valid yang berhasil dikumpulkan, maksimal 50. |
 | V13 | Samples Used | Integer | count | Jumlah sampel yang dipakai dalam trimmed mean setelah filter MAD dan trimming. |
@@ -182,6 +182,28 @@ Untuk V18, buat Datastream String dan hubungkan ke widget Label atau Value
 Display. Firmware memperbarui V18 setiap kali berhasil tersambung ke Blynk agar
 dashboard menunjukkan SSID aktif. Hanya nama SSID yang dikirim; password dan
 BSSID tidak dikirim.
+
+Untuk V10, buat Datastream **String** dengan panjang maksimum `255`, lalu
+hubungkan widget **Terminal** ke V10. Aktifkan input, auto-scroll, dan penambahan
+baris baru pada widget. Jangan aktifkan **Sync with latest server value** untuk
+V10 karena perintah lama tidak boleh dijalankan kembali setelah reconnect.
+Gunakan perintah berikut:
+
+```text
+help
+mqtt show
+mqtt set 192.168.1.50
+mqtt apply
+mqtt reset
+```
+
+`mqtt set` hanya menerima satu alamat IPv4 unicast dan menyimpannya ke NVS;
+password MQTT tidak diperlukan. Perubahan berlaku pada wake/restart berikutnya.
+`mqtt apply` me-restart perangkat setelah satu detik agar nilai tersimpan segera
+dipakai. `mqtt reset` menghapus override dan mengembalikan `MQTT_HOST` dari
+`include/device_config.h` pada restart berikutnya. Jika deep sleep aktif, buka
+Terminal ketika perangkat sedang online; untuk konfigurasi lebih nyaman,
+aktifkan V17 **Stay Awake** sementara lalu kembalikan ke `0` setelah selesai.
 
 Untuk V19, gunakan rentang `-1` sampai `8064`. Untuk V20 dan V21, gunakan rentang
 `0` sampai `2147483647`. Aktifkan **Sync with latest server value** pada V21.

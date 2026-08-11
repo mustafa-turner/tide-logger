@@ -9,6 +9,7 @@
 
 #include "TelemetryDelivery.h"
 #include "TelemetryDeliveryState.h"
+#include "MqttHostConfig.h"
 #include "TelemetryPayload.h"
 
 using tide::MeasurementRecord;
@@ -152,6 +153,22 @@ void test_dual_destination_cursors_advance_independently() {
       3, tide::telemetryPendingOffset(UINT32_MAX - 1U, 1));
 }
 
+void test_mqtt_runtime_host_requires_unicast_ipv4() {
+  TEST_ASSERT_TRUE(tide::isValidMqttIpv4("192.168.1.50"));
+  TEST_ASSERT_TRUE(tide::isValidMqttIpv4("172.27.111.115"));
+  TEST_ASSERT_TRUE(tide::isValidMqttIpv4("1.2.3.4"));
+
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4(nullptr));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4(""));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4("mqtt.local"));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4("192.168.1"));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4("192.168.1.256"));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4("192.168.1.50 extra"));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4("0.0.0.0"));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4("224.0.0.1"));
+  TEST_ASSERT_FALSE(tide::isValidMqttIpv4("255.255.255.255"));
+}
+
 }  // namespace
 
 int runTelemetryTests() {
@@ -161,6 +178,7 @@ int runTelemetryTests() {
   RUN_TEST(test_invalid_optional_values_are_omitted_but_diagnostics_remain);
   RUN_TEST(test_only_matching_puback_transitions_delivery);
   RUN_TEST(test_dual_destination_cursors_advance_independently);
+  RUN_TEST(test_mqtt_runtime_host_requires_unicast_ipv4);
   return UNITY_END();
 }
 
