@@ -6,7 +6,7 @@
 #include "TelemetryPayload.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.4.2"
+#define BLYNK_FIRMWARE_VERSION "1.4.3"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -59,6 +59,8 @@ namespace
   constexpr uint32_t MEASUREMENT_INTERVAL_MS =
       MEASUREMENT_INTERVAL_SECONDS * 1000UL;
   constexpr uint32_t EDGENT_CONNECT_TIMEOUT_MS = 15000;
+  constexpr uint32_t STAY_AWAKE_WIFI_REPROVISION_MS = 2UL * 60UL * 1000UL;
+  constexpr uint32_t WIFI_FALLBACK_SERVICE_INTERVAL_MS = 1000;
   constexpr uint32_t BLYNK_SYNC_FALLBACK_MS = 3000;
   constexpr uint32_t OTA_LISTEN_WINDOW_MS = 15000;
   constexpr uint32_t MINIMUM_SLEEP_MS = 1000;
@@ -148,11 +150,13 @@ namespace
   bool edgentConnectTimeoutArmed = false;
   bool edgentConnectTimedOut = false;
   bool provisioningRequested = false;
+  bool stayAwakeWifiFailureTracked = false;
   bool cycleUploaded = false;
   bool v6SyncReceived = false;
   bool v17SyncReceived = false;
   bool deepSleepDisabled = false;
   uint32_t edgentConnectStartedAt = 0;
+  uint32_t stayAwakeWifiFailureStartedAt = 0;
   uint32_t blynkConnectedAt = 0;
   uint32_t cycleUploadedAt = 0;
   bool ntpSyncRequested = false;
@@ -1547,6 +1551,66 @@ namespace
     return configStore.getFlag(CONFIG_FLAG_VALID);
   }
 
+  void clearStayAwakeWifiFailureTracking()
+  {
+    stayAwakeWifiFailureTracked = false;
+    stayAwakeWifiFailureStartedAt = 0;
+  }
+
+  void serviceStayAwakeWifiProvisioningFallback()
+  {
+    // Automatic re-provisioning is deliberately exclusive to Stay Awake.
+    // Normal wake cycles must keep their saved credentials, time out, queue
+    // telemetry, and sleep when either Wi-Fi or the internet is unavailable.
+    if (!deepSleepDisabled || provisioningRequested || !edgentIsConfigured())
+    {
+      clearStayAwakeWifiFailureTracking();
+      return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      // A Blynk Cloud/internet outage is not a Wi-Fi credential failure.
+      clearStayAwakeWifiFailureTracking();
+      return;
+    }
+
+    if (!BlynkState::is(MODE_CONNECTING_NET) &&
+        !BlynkState::is(MODE_ERROR))
+    {
+      return;
+    }
+
+    if (!stayAwakeWifiFailureTracked)
+    {
+      stayAwakeWifiFailureTracked = true;
+      stayAwakeWifiFailureStartedAt = millis();
+      Serial.printf("Stay Awake: Wi-Fi belum tersambung; portal konfigurasi "
+                    "akan dibuka setelah %lu detik jika kegagalan berlanjut.\n",
+                    static_cast<unsigned long>(
+                        STAY_AWAKE_WIFI_REPROVISION_MS / 1000UL));
+      return;
+    }
+
+    if (millis() - stayAwakeWifiFailureStartedAt <
+        STAY_AWAKE_WIFI_REPROVISION_MS)
+    {
+      return;
+    }
+
+    clearStayAwakeWifiFailureTracking();
+    provisioningRequested = true;
+    edgentConnectTimeoutArmed = false;
+    edgentConnectTimedOut = false;
+    Blynk.disconnect();
+    WiFi.disconnect();
+    Serial.println("Stay Awake: Wi-Fi tetap gagal; membuka access point Blynk "
+                   "untuk konfigurasi ulang.");
+    // Keep the last-known configuration recoverable until the user actually
+    // submits replacement credentials through the Edgent portal.
+    BlynkState::set(MODE_WAIT_CONFIG);
+  }
+
   bool otaIsPendingOrRunning()
   {
     return overTheAirURL.length() > 0 ||
@@ -1614,6 +1678,10 @@ namespace
     {
       edgentConnectTimeoutArmed = false;
       edgentConnectTimedOut = false;
+    }
+    else
+    {
+      clearStayAwakeWifiFailureTracking();
     }
     Serial.printf("V17 Stay Awake: %s (deep sleep %s).\n",
                   disabled ? "ON" : "OFF", disabled ? "nonaktif" : "aktif");
@@ -1695,6 +1763,12 @@ namespace
 
 BLYNK_CONNECTED()
 {
+  if (provisioningRequested)
+  {
+    provisioningRequested = false;
+    Serial.println("Konfigurasi Edgent tervalidasi; koneksi Blynk aktif.");
+  }
+  clearStayAwakeWifiFailureTracking();
   blynkConnectedAt = millis();
   serviceNetworkTime();
   v6SyncReceived = false;
@@ -1868,6 +1942,8 @@ void setup()
   }
 
   BlynkEdgent.begin();
+  edgentTimer.setInterval(WIFI_FALLBACK_SERVICE_INTERVAL_MS,
+                          serviceStayAwakeWifiProvisioningFallback);
   edgentConfiguredAtBoot = edgentIsConfigured();
   provisioningRequested = !edgentConfiguredAtBoot;
   registerA02YYUWConsoleCommand();

@@ -178,6 +178,22 @@ ke widget Switch. Nilai `0` mengaktifkan siklus deep sleep normal, sedangkan
 nilai `1` menonaktifkan deep sleep. Pilihan ini disimpan ke NVS dan disinkronkan
 dari Blynk ketika perangkat tersambung kembali.
 
+Saat V17 **Stay Awake** bernilai `1`, kegagalan menyambung ke Wi-Fi secara terus
+menerus selama dua menit akan membuka access point provisioning Blynk.
+Sambungkan ponsel ke access point bernama `Blynk <nama-template>-XXXX`, lalu
+lakukan konfigurasi ulang melalui aplikasi Blynk seperti saat pemasangan
+pertama. Konfigurasi lama tetap tersimpan sampai pengganti dikirim melalui
+portal. Fallback ini hanya dipicu ketika ESP32 tidak tersambung ke Wi-Fi. Jika
+Wi-Fi tersambung tetapi internet atau Blynk Cloud sedang offline, konfigurasi
+Wi-Fi tidak dihapus.
+
+Saat V17 bernilai `0`, perilaku siklus hemat daya tidak berubah: perangkat
+mencoba koneksi dalam jendela aktif yang dibatasi, menyimpan record yang belum
+terkirim, lalu deep sleep dan mencoba lagi pada wake berikutnya. Kegagalan Wi-Fi
+atau internet pada mode ini tidak otomatis membuka AP dan tidak menghapus
+kredensial. Provisioning pertama dan reset manual dengan tombol BOOT tetap
+menahan perangkat dalam portal sampai konfigurasi selesai.
+
 Untuk V18, buat Datastream String dan hubungkan ke widget Label atau Value
 Display. Firmware memperbarui V18 setiap kali berhasil tersambung ke Blynk agar
 dashboard menunjukkan SSID aktif. Hanya nama SSID yang dikirim; password dan
