@@ -12,7 +12,7 @@ constexpr uint32_t DELIVERY_HEADER_MAGIC = 0x444C5652UL;  // DLVR
 constexpr uint32_t RECORD_MAGIC = 0x574C564CUL;           // WLVL
 constexpr uint16_t QUEUE_SCHEMA_VERSION = 1;
 constexpr uint16_t DELIVERY_SCHEMA_VERSION = 1;
-constexpr uint16_t RECORD_SCHEMA_VERSION = 1;
+constexpr uint16_t RECORD_SCHEMA_VERSION = 2;
 constexpr uint8_t HEADER_COPY_COUNT = 2;
 }  // namespace
 
@@ -28,13 +28,19 @@ uint32_t OfflineQueue::checksumBytes(const void *data, size_t length) {
 
 void OfflineQueue::finalizeRecord(MeasurementRecord &record) {
   record.magic = RECORD_MAGIC;
-  record.schemaVersion = RECORD_SCHEMA_VERSION;
+  // Preserve schema v1 when an old queued record only needs a new checksum.
+  // New records opt into v2 through setMeasurementSampleCounts().
+  if (record.schemaVersion != 1 &&
+      record.schemaVersion != RECORD_SCHEMA_VERSION) {
+    record.schemaVersion = RECORD_SCHEMA_VERSION;
+  }
   record.checksum = checksumBytes(&record, offsetof(MeasurementRecord, checksum));
 }
 
 bool OfflineQueue::isRecordValid(const MeasurementRecord &record) {
   return record.magic == RECORD_MAGIC &&
-         record.schemaVersion == RECORD_SCHEMA_VERSION &&
+         (record.schemaVersion == 1 ||
+          record.schemaVersion == RECORD_SCHEMA_VERSION) &&
          record.checksum ==
              checksumBytes(&record, offsetof(MeasurementRecord, checksum));
 }

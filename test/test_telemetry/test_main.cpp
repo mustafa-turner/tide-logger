@@ -169,6 +169,18 @@ void test_mqtt_runtime_host_requires_unicast_ipv4() {
   TEST_ASSERT_FALSE(tide::isValidMqttIpv4("255.255.255.255"));
 }
 
+void test_schema_v2_packs_large_timed_sample_counts() {
+  MeasurementRecord record = {};
+  tide::setMeasurementSampleCounts(record, 600, 540);
+
+  TEST_ASSERT_EQUAL_UINT16(2, record.schemaVersion);
+  TEST_ASSERT_EQUAL_UINT16(600, tide::measurementAcquiredSamples(record));
+  TEST_ASSERT_EQUAL_UINT16(540, tide::measurementInlierSamples(record));
+  TEST_ASSERT_EQUAL_UINT16(432, tide::measurementUsedSamples(record));
+  TEST_ASSERT_EQUAL_UINT16(60, tide::measurementOutlierSamples(record));
+  TEST_ASSERT_EQUAL_UINT32(66, sizeof(record));
+}
+
 }  // namespace
 
 int runTelemetryTests() {
@@ -179,6 +191,7 @@ int runTelemetryTests() {
   RUN_TEST(test_only_matching_puback_transitions_delivery);
   RUN_TEST(test_dual_destination_cursors_advance_independently);
   RUN_TEST(test_mqtt_runtime_host_requires_unicast_ipv4);
+  RUN_TEST(test_schema_v2_packs_large_timed_sample_counts);
   return UNITY_END();
 }
 

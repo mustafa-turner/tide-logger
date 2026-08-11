@@ -198,12 +198,13 @@ bool serializeTelemetryPayload(const MeasurementRecord &record,
   }
 
   json.uintField("measurement_quality", record.quality);
-  json.uintField("samples_acquired", record.acquiredSamples);
-  json.uintField("samples_used", record.usedSamples);
-  json.uintField("mad_outliers", record.outlierSamples);
+  const uint16_t acquiredSamples = measurementAcquiredSamples(record);
+  json.uintField("samples_acquired", acquiredSamples);
+  json.uintField("samples_used", measurementUsedSamples(record));
+  json.uintField("mad_outliers", measurementOutlierSamples(record));
   // Schema v1 has no separate MAD-valid bit. Acquisition reaches the MAD
   // calculation only at 30 samples, so omit it below that threshold.
-  if (record.acquiredSamples >= 30 && validFloat(record.distanceMadMm)) {
+  if (acquiredSamples >= 30 && validFloat(record.distanceMadMm)) {
     json.floatField("distance_mad_mm", record.distanceMadMm, 2);
   }
   json.uintField("acquisition_duration_ms", record.acquisitionDurationMs);

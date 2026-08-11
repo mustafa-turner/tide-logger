@@ -49,15 +49,23 @@ namespace
   constexpr uint8_t A02YYUW_POWER_PIN = D0;
   constexpr uint32_t A02YYUW_WARMUP_MS = 1000;
   constexpr uint8_t A02YYUW_DISCARD_SAMPLES = 5;
-  constexpr uint8_t A02YYUW_TARGET_SAMPLES = 50;
   constexpr uint8_t A02YYUW_MIN_VALID_SAMPLES = 30;
-  constexpr uint32_t A02YYUW_ACQUISITION_TIMEOUT_MS = 20000;
   constexpr float A02YYUW_MIN_OUTLIER_LIMIT_MM = 20.0f;
   constexpr float A02YYUW_GOOD_MAX_MAD_MM = 30.0f;
 
-  constexpr uint32_t MEASUREMENT_INTERVAL_SECONDS = 5UL * 60UL;
-  constexpr uint32_t MEASUREMENT_INTERVAL_MS =
-      MEASUREMENT_INTERVAL_SECONDS * 1000UL;
+  constexpr uint32_t DEFAULT_MEASUREMENT_INTERVAL_SECONDS = 10UL * 60UL;
+  constexpr uint32_t MIN_MEASUREMENT_INTERVAL_SECONDS = 60;
+  constexpr uint32_t MAX_MEASUREMENT_INTERVAL_SECONDS = 24UL * 60UL * 60UL;
+  constexpr uint32_t DEFAULT_COLLECTION_WINDOW_SECONDS = 60;
+  constexpr uint32_t MIN_COLLECTION_WINDOW_SECONDS = 5;
+  constexpr uint32_t MAX_COLLECTION_WINDOW_SECONDS = 120;
+  constexpr uint32_t MIN_POST_COLLECTION_OVERHEAD_SECONDS = 30;
+  // A02YYUW normally emits about 10 frames/s. Keep 20% headroom while
+  // retaining every valid frame needed by median/MAD for the full window.
+  constexpr uint16_t A02YYUW_SAMPLE_CAPACITY =
+      MAX_COLLECTION_WINDOW_SECONDS * 12U;
+  static_assert(A02YYUW_SAMPLE_CAPACITY <= 0x0FFF,
+                "Packed offline sample counters support at most 4095");
   constexpr uint32_t EDGENT_CONNECT_TIMEOUT_MS = 15000;
   constexpr uint32_t STAY_AWAKE_WIFI_REPROVISION_MS = 2UL * 60UL * 1000UL;
   constexpr uint32_t WIFI_FALLBACK_SERVICE_INTERVAL_MS = 1000;
@@ -75,6 +83,10 @@ namespace
   constexpr char NTP_SERVER_SECONDARY[] = "time.google.com";
   constexpr char NTP_SERVER_TERTIARY[] = "time.cloudflare.com";
   constexpr char STAY_AWAKE_KEY[] = "stay_awake";
+  constexpr char WIFI_FAILURE_COUNT_KEY[] = "wifi_fail";
+  constexpr uint8_t WIFI_FAILURES_BEFORE_PROVISIONING = 3;
+  constexpr char MEASUREMENT_INTERVAL_KEY[] = "measure_s";
+  constexpr char COLLECTION_WINDOW_KEY[] = "collect_s";
   constexpr char MQTT_HOST_KEY[] = "mqtt_host";
   // Preserve support for a full DNS hostname in device_config.h, even though
   // runtime changes from Blynk intentionally accept IPv4 addresses only.
@@ -98,6 +110,9 @@ namespace
   uint16_t latestDistanceMm = 0;
   int32_t latestWaterLevelMm = 0;
   uint32_t sensorHeightMm = DEFAULT_SENSOR_HEIGHT_MM;
+  uint32_t measurementIntervalSeconds =
+      DEFAULT_MEASUREMENT_INTERVAL_SECONDS;
+  uint32_t collectionWindowSeconds = DEFAULT_COLLECTION_WINDOW_SECONDS;
   bool solarVoltageValid = false;
   bool batteryValid = false;
   bool system5VVoltageValid = false;
@@ -128,13 +143,16 @@ namespace
 
   uint8_t a02Frame[4] = {};
   uint8_t a02FrameIndex = 0;
-  uint16_t a02Samples[A02YYUW_TARGET_SAMPLES] = {};
+  uint16_t a02Samples[A02YYUW_SAMPLE_CAPACITY] = {};
+  float a02Deviations[A02YYUW_SAMPLE_CAPACITY] = {};
+  uint16_t a02Inliers[A02YYUW_SAMPLE_CAPACITY] = {};
   uint8_t a02DiscardedSamples = 0;
-  uint8_t a02AcquiredSamples = 0;
+  uint16_t a02AcquiredSamples = 0;
   uint16_t a02ChecksumErrors = 0;
   uint16_t a02RangeErrors = 0;
-  uint8_t a02UsedSamples = 0;
-  uint8_t a02OutlierSamples = 0;
+  uint16_t a02UsedSamples = 0;
+  uint16_t a02OutlierSamples = 0;
+  bool a02SampleBufferFull = false;
   float latestDistanceMedianMm = NAN;
   float latestDistanceMadMm = NAN;
   float latestOutlierLimitMm = NAN;
@@ -151,6 +169,7 @@ namespace
   bool edgentConnectTimedOut = false;
   bool provisioningRequested = false;
   bool stayAwakeWifiFailureTracked = false;
+  uint8_t consecutiveWifiFailedWakeCycles = 0;
   bool cycleUploaded = false;
   bool v6SyncReceived = false;
   bool v17SyncReceived = false;
@@ -222,7 +241,7 @@ namespace
     }
 
     cycleAbsoluteSlot =
-        static_cast<uint64_t>(utcNow.tv_sec) / MEASUREMENT_INTERVAL_SECONDS;
+        static_cast<uint64_t>(utcNow.tv_sec) / measurementIntervalSeconds;
     cycleAbsoluteSlotValid = true;
 
     char timestamp[32] = {};
@@ -259,7 +278,8 @@ namespace
       if (normalCycleStarted && !cycleAbsoluteSlotValid)
       {
         captureCurrentAbsoluteSlot();
-        Serial.println("Siklus berikutnya akan mengikuti batas absolut 5 menit.");
+        Serial.printf("Siklus berikutnya mengikuti batas absolut %lu detik.\n",
+                      static_cast<unsigned long>(measurementIntervalSeconds));
       }
       return;
     }
@@ -278,7 +298,7 @@ namespace
     if (getValidUtcTime(utcNow))
     {
       const uint64_t currentSlot =
-          static_cast<uint64_t>(utcNow.tv_sec) / MEASUREMENT_INTERVAL_SECONDS;
+          static_cast<uint64_t>(utcNow.tv_sec) / measurementIntervalSeconds;
       if (!cycleAbsoluteSlotValid)
       {
         cycleAbsoluteSlot = currentSlot;
@@ -288,7 +308,7 @@ namespace
       return currentSlot > cycleAbsoluteSlot;
     }
 
-    return millis() - cycleStartedAt >= MEASUREMENT_INTERVAL_MS;
+    return millis() - cycleStartedAt >= measurementIntervalSeconds * 1000UL;
   }
 
   bool calculateAbsoluteSleep(uint64_t &sleepDurationUs,
@@ -302,7 +322,7 @@ namespace
 
     constexpr uint64_t MICROSECONDS_PER_SECOND = 1000000ULL;
     const uint64_t intervalUs =
-        static_cast<uint64_t>(MEASUREMENT_INTERVAL_SECONDS) *
+        static_cast<uint64_t>(measurementIntervalSeconds) *
         MICROSECONDS_PER_SECOND;
     const uint64_t currentEpochUs =
         static_cast<uint64_t>(utcNow.tv_sec) * MICROSECONDS_PER_SECOND +
@@ -311,7 +331,7 @@ namespace
     sleepDurationUs = intervalUs - elapsedInSlotUs;
 
     // Hindari bangun ulang hampir seketika apabila proses selesai tepat sebelum
-    // batas slot. Dalam kondisi ini gunakan batas lima menit sesudahnya.
+    // batas slot. Dalam kondisi ini gunakan batas interval sesudahnya.
     if (sleepDurationUs < 100000ULL)
     {
       sleepDurationUs += intervalUs;
@@ -426,13 +446,77 @@ namespace
     Blynk.virtualWrite(V10, message);
   }
 
-  void showMqttTerminalHelp()
+  bool parseUnsignedSeconds(String value, uint32_t &parsed)
   {
-    blynkTerminalPrintf(
-        "Commands:\nmqtt show\nmqtt set <IPv4>\nmqtt reset\nmqtt apply");
+    value.trim();
+    if (value.isEmpty())
+    {
+      return false;
+    }
+
+    uint64_t result = 0;
+    for (size_t i = 0; i < value.length(); ++i)
+    {
+      const char character = value.charAt(i);
+      if (character < '0' || character > '9')
+      {
+        return false;
+      }
+      result = result * 10ULL + static_cast<uint8_t>(character - '0');
+      if (result > UINT32_MAX)
+      {
+        return false;
+      }
+    }
+    parsed = static_cast<uint32_t>(result);
+    return true;
   }
 
-  void handleMqttTerminalCommand(String command)
+  bool measurementTimingIsValid(uint32_t intervalSeconds,
+                                uint32_t windowSeconds)
+  {
+    return intervalSeconds >= MIN_MEASUREMENT_INTERVAL_SECONDS &&
+           intervalSeconds <= MAX_MEASUREMENT_INTERVAL_SECONDS &&
+           windowSeconds >= MIN_COLLECTION_WINDOW_SECONDS &&
+           windowSeconds <= MAX_COLLECTION_WINDOW_SECONDS &&
+           intervalSeconds >=
+               windowSeconds + MIN_POST_COLLECTION_OVERHEAD_SECONDS;
+  }
+
+  void loadMeasurementTimingConfiguration()
+  {
+    const uint32_t storedInterval = appPreferences.getUInt(
+        MEASUREMENT_INTERVAL_KEY, DEFAULT_MEASUREMENT_INTERVAL_SECONDS);
+    const uint32_t storedWindow = appPreferences.getUInt(
+        COLLECTION_WINDOW_KEY, DEFAULT_COLLECTION_WINDOW_SECONDS);
+    if (measurementTimingIsValid(storedInterval, storedWindow))
+    {
+      measurementIntervalSeconds = storedInterval;
+      collectionWindowSeconds = storedWindow;
+      return;
+    }
+
+    measurementIntervalSeconds = DEFAULT_MEASUREMENT_INTERVAL_SECONDS;
+    collectionWindowSeconds = DEFAULT_COLLECTION_WINDOW_SECONDS;
+    appPreferences.putUInt(MEASUREMENT_INTERVAL_KEY,
+                           measurementIntervalSeconds);
+    appPreferences.putUInt(COLLECTION_WINDOW_KEY, collectionWindowSeconds);
+    Serial.println("Konfigurasi waktu ukur di NVS tidak valid; memakai 600s/60s.");
+  }
+
+  void realignMeasurementSchedule()
+  {
+    cycleAbsoluteSlotValid = false;
+    captureCurrentAbsoluteSlot();
+  }
+
+  void showTerminalHelp()
+  {
+    blynkTerminalPrintf(
+        "Commands:\nmqtt show | set <IPv4> | reset | apply\nmeasure show\nmeasure interval <seconds>\nmeasure duration <seconds>\nmeasure reset");
+  }
+
+  void handleTerminalCommand(String command)
   {
     command.trim();
     String normalized = command;
@@ -440,7 +524,94 @@ namespace
 
     if (normalized.isEmpty() || normalized == "help")
     {
-      showMqttTerminalHelp();
+      showTerminalHelp();
+      return;
+    }
+
+    if (normalized == "measure show")
+    {
+      blynkTerminalPrintf("Interval: %lus\nCollection window: %lus\nSamples: all valid frames in window",
+                          static_cast<unsigned long>(measurementIntervalSeconds),
+                          static_cast<unsigned long>(collectionWindowSeconds));
+      return;
+    }
+
+    if (normalized.startsWith("measure interval "))
+    {
+      uint32_t requestedSeconds = 0;
+      if (!parseUnsignedSeconds(command.substring(17), requestedSeconds) ||
+          !measurementTimingIsValid(requestedSeconds,
+                                    collectionWindowSeconds))
+      {
+        blynkTerminalPrintf("Rejected: interval %lu-%lus and at least duration + %lus",
+                            static_cast<unsigned long>(
+                                MIN_MEASUREMENT_INTERVAL_SECONDS),
+                            static_cast<unsigned long>(
+                                MAX_MEASUREMENT_INTERVAL_SECONDS),
+                            static_cast<unsigned long>(
+                                MIN_POST_COLLECTION_OVERHEAD_SECONDS));
+        return;
+      }
+      if (appPreferences.putUInt(MEASUREMENT_INTERVAL_KEY,
+                                 requestedSeconds) != sizeof(uint32_t))
+      {
+        blynkTerminalPrintf("Error: interval was not saved");
+        return;
+      }
+      measurementIntervalSeconds = requestedSeconds;
+      realignMeasurementSchedule();
+      blynkTerminalPrintf("Measurement interval saved: %lu seconds",
+                          static_cast<unsigned long>(requestedSeconds));
+      return;
+    }
+
+    if (normalized.startsWith("measure duration "))
+    {
+      uint32_t requestedSeconds = 0;
+      if (!parseUnsignedSeconds(command.substring(17), requestedSeconds) ||
+          !measurementTimingIsValid(measurementIntervalSeconds,
+                                    requestedSeconds))
+      {
+        blynkTerminalPrintf("Rejected: duration %lu-%lus and interval must be duration + %lus",
+                            static_cast<unsigned long>(
+                                MIN_COLLECTION_WINDOW_SECONDS),
+                            static_cast<unsigned long>(
+                                MAX_COLLECTION_WINDOW_SECONDS),
+                            static_cast<unsigned long>(
+                                MIN_POST_COLLECTION_OVERHEAD_SECONDS));
+        return;
+      }
+      if (appPreferences.putUInt(COLLECTION_WINDOW_KEY,
+                                 requestedSeconds) != sizeof(uint32_t))
+      {
+        blynkTerminalPrintf("Error: duration was not saved");
+        return;
+      }
+      collectionWindowSeconds = requestedSeconds;
+      blynkTerminalPrintf("Collection window saved: %lu seconds",
+                          static_cast<unsigned long>(requestedSeconds));
+      return;
+    }
+
+    if (normalized == "measure reset")
+    {
+      const bool intervalSaved =
+          appPreferences.putUInt(MEASUREMENT_INTERVAL_KEY,
+                                 DEFAULT_MEASUREMENT_INTERVAL_SECONDS) ==
+          sizeof(uint32_t);
+      const bool windowSaved =
+          appPreferences.putUInt(COLLECTION_WINDOW_KEY,
+                                 DEFAULT_COLLECTION_WINDOW_SECONDS) ==
+          sizeof(uint32_t);
+      if (!intervalSaved || !windowSaved)
+      {
+        blynkTerminalPrintf("Error: default measurement timing was not saved");
+        return;
+      }
+      measurementIntervalSeconds = DEFAULT_MEASUREMENT_INTERVAL_SECONDS;
+      collectionWindowSeconds = DEFAULT_COLLECTION_WINDOW_SECONDS;
+      realignMeasurementSchedule();
+      blynkTerminalPrintf("Measurement reset: interval 600s, duration 60s");
       return;
     }
 
@@ -506,7 +677,7 @@ namespace
   {
     if (cycleStartedWithAbsoluteTime && cycleAbsoluteSlotValid)
     {
-      return cycleAbsoluteSlot * MEASUREMENT_INTERVAL_SECONDS * 1000ULL;
+      return cycleAbsoluteSlot * measurementIntervalSeconds * 1000ULL;
     }
 
     timeval utcNow = {};
@@ -561,9 +732,11 @@ namespace
     record.distanceMadMm =
         isnan(latestDistanceMadMm) ? 0.0f : latestDistanceMadMm;
     record.acquisitionDurationMs = latestAcquisitionDurationMs;
-    record.acquiredSamples = a02AcquiredSamples;
-    record.usedSamples = a02UsedSamples;
-    record.outlierSamples = a02OutlierSamples;
+    tide::setMeasurementSampleCounts(
+        record, a02AcquiredSamples,
+        a02AcquiredSamples >= a02OutlierSamples
+            ? a02AcquiredSamples - a02OutlierSamples
+            : 0);
     record.quality = static_cast<uint8_t>(measurementQuality);
     return record;
   }
@@ -685,9 +858,9 @@ namespace
     }
 
     Blynk.virtualWrite(V11, record.quality);
-    Blynk.virtualWrite(V12, record.acquiredSamples);
-    Blynk.virtualWrite(V13, record.usedSamples);
-    Blynk.virtualWrite(V14, record.outlierSamples);
+    Blynk.virtualWrite(V12, tide::measurementAcquiredSamples(record));
+    Blynk.virtualWrite(V13, tide::measurementUsedSamples(record));
+    Blynk.virtualWrite(V14, tide::measurementOutlierSamples(record));
     Blynk.virtualWrite(V15, record.distanceMadMm);
     Blynk.virtualWrite(V16, record.acquisitionDurationMs);
     Blynk.virtualWrite(V21, record.sequence);
@@ -1216,9 +1389,9 @@ namespace
     return A02FrameResult::NONE;
   }
 
-  void sortUint16(uint16_t *values, uint8_t count)
+  void sortUint16(uint16_t *values, uint16_t count)
   {
-    for (uint8_t i = 1; i < count; ++i)
+    for (uint16_t i = 1; i < count; ++i)
     {
       const uint16_t key = values[i];
       int16_t j = i - 1;
@@ -1231,9 +1404,9 @@ namespace
     }
   }
 
-  void sortFloat(float *values, uint8_t count)
+  void sortFloat(float *values, uint16_t count)
   {
-    for (uint8_t i = 1; i < count; ++i)
+    for (uint16_t i = 1; i < count; ++i)
     {
       const float key = values[i];
       int16_t j = i - 1;
@@ -1246,7 +1419,7 @@ namespace
     }
   }
 
-  float medianSorted(const uint16_t *values, uint8_t count)
+  float medianSorted(const uint16_t *values, uint16_t count)
   {
     if (count % 2 != 0)
     {
@@ -1255,7 +1428,7 @@ namespace
     return (values[count / 2 - 1] + values[count / 2]) * 0.5f;
   }
 
-  float medianSorted(const float *values, uint8_t count)
+  float medianSorted(const float *values, uint16_t count)
   {
     if (count % 2 != 0)
     {
@@ -1281,38 +1454,36 @@ namespace
       latestDistanceMedianMm =
           medianSorted(a02Samples, a02AcquiredSamples);
 
-      float deviations[A02YYUW_TARGET_SAMPLES] = {};
-      for (uint8_t i = 0; i < a02AcquiredSamples; ++i)
+      for (uint16_t i = 0; i < a02AcquiredSamples; ++i)
       {
-        deviations[i] = fabsf(a02Samples[i] - latestDistanceMedianMm);
+        a02Deviations[i] = fabsf(a02Samples[i] - latestDistanceMedianMm);
       }
-      sortFloat(deviations, a02AcquiredSamples);
-      latestDistanceMadMm = medianSorted(deviations, a02AcquiredSamples);
+      sortFloat(a02Deviations, a02AcquiredSamples);
+      latestDistanceMadMm = medianSorted(a02Deviations, a02AcquiredSamples);
       latestOutlierLimitMm =
           max(A02YYUW_MIN_OUTLIER_LIMIT_MM,
               3.0f * 1.4826f * latestDistanceMadMm);
 
-      uint16_t inliers[A02YYUW_TARGET_SAMPLES] = {};
-      uint8_t inlierCount = 0;
-      for (uint8_t i = 0; i < a02AcquiredSamples; ++i)
+      uint16_t inlierCount = 0;
+      for (uint16_t i = 0; i < a02AcquiredSamples; ++i)
       {
         if (fabsf(a02Samples[i] - latestDistanceMedianMm) <=
             latestOutlierLimitMm)
         {
-          inliers[inlierCount++] = a02Samples[i];
+          a02Inliers[inlierCount++] = a02Samples[i];
         }
       }
       a02OutlierSamples = a02AcquiredSamples - inlierCount;
 
       if (inlierCount >= A02YYUW_MIN_VALID_SAMPLES)
       {
-        const uint8_t trimEachSide = inlierCount / 10;
+        const uint16_t trimEachSide = inlierCount / 10;
         a02UsedSamples = inlierCount - (2 * trimEachSide);
         double sum = 0.0;
-        for (uint8_t i = trimEachSide;
+        for (uint16_t i = trimEachSide;
              i < inlierCount - trimEachSide; ++i)
         {
-          sum += inliers[i];
+          sum += a02Inliers[i];
         }
 
         latestDistanceMm = static_cast<uint16_t>(
@@ -1329,8 +1500,9 @@ namespace
             static_cast<uint32_t>(a02AcquiredSamples) * 100 >=
                 candidateFrames * 90;
         measurementQuality =
-            (a02AcquiredSamples == A02YYUW_TARGET_SAMPLES &&
-             inlierCount >= 40 &&
+            (!a02SampleBufferFull &&
+             static_cast<uint32_t>(inlierCount) * 100U >=
+                 static_cast<uint32_t>(a02AcquiredSamples) * 80U &&
              latestDistanceMadMm <= A02YYUW_GOOD_MAX_MAD_MM &&
              protocolQualityGood)
                 ? MeasurementQuality::GOOD
@@ -1346,6 +1518,11 @@ namespace
                   "range_error=%u\n",
                   a02AcquiredSamples, a02UsedSamples, a02OutlierSamples,
                   a02ChecksumErrors, a02RangeErrors);
+    if (a02SampleBufferFull)
+    {
+      Serial.printf("  PERINGATAN: buffer %u sampel penuh; quality diturunkan.\n",
+                    A02YYUW_SAMPLE_CAPACITY);
+    }
     if (distanceValid)
     {
       Serial.printf("  median=%.1f mm, MAD=%.1f mm, limit=%.1f mm\n",
@@ -1401,10 +1578,12 @@ namespace
     a02RangeErrors = 0;
     a02UsedSamples = 0;
     a02OutlierSamples = 0;
+    a02SampleBufferFull = false;
     latestAcquisitionDurationMs = 0;
     resetA02FrameParser();
     setA02YYUWPower(true);
-    Serial.println("Siklus 5 menit dimulai: mengukur sebelum koneksi cloud.");
+    Serial.printf("Siklus %lu detik dimulai: mengukur sebelum koneksi cloud.\n",
+                  static_cast<unsigned long>(measurementIntervalSeconds));
   }
 
   void serviceAutomaticA02YYUWMeasurement()
@@ -1427,9 +1606,10 @@ namespace
       resetA02FrameParser();
       a02yyuwWarmupComplete = true;
       a02AcquisitionStartedAt = millis();
-      Serial.printf("A02YYUW warm-up selesai; buang %u frame lalu ambil %u "
-                    "sampel processed-mode.\n",
-                    A02YYUW_DISCARD_SAMPLES, A02YYUW_TARGET_SAMPLES);
+      Serial.printf("A02YYUW warm-up selesai; buang %u frame lalu kumpulkan "
+                    "semua sampel selama %lu detik.\n",
+                    A02YYUW_DISCARD_SAMPLES,
+                    static_cast<unsigned long>(collectionWindowSeconds));
     }
 
     for (uint8_t processedFrames = 0; processedFrames < 64; ++processedFrames)
@@ -1452,14 +1632,18 @@ namespace
 
       if (result == A02FrameResult::VALID)
       {
-        if (a02AcquiredSamples < A02YYUW_TARGET_SAMPLES)
+        if (a02AcquiredSamples < A02YYUW_SAMPLE_CAPACITY)
         {
           a02Samples[a02AcquiredSamples++] = distanceMm;
-          if (a02AcquiredSamples % 10 == 0)
+          if (a02AcquiredSamples % 100 == 0)
           {
-            Serial.printf("A02YYUW: %u/%u sampel terkumpul.\n",
-                          a02AcquiredSamples, A02YYUW_TARGET_SAMPLES);
+            Serial.printf("A02YYUW: %u sampel terkumpul.\n",
+                          a02AcquiredSamples);
           }
+        }
+        else
+        {
+          a02SampleBufferFull = true;
         }
       }
       else if (result == A02FrameResult::CHECKSUM_ERROR)
@@ -1472,9 +1656,8 @@ namespace
       }
     }
 
-    if (a02AcquiredSamples >= A02YYUW_TARGET_SAMPLES ||
-        millis() - a02AcquisitionStartedAt >=
-            A02YYUW_ACQUISITION_TIMEOUT_MS)
+    if (millis() - a02AcquisitionStartedAt >=
+            collectionWindowSeconds * 1000UL)
     {
       finalizeA02YYUWMeasurement();
     }
@@ -1557,8 +1740,61 @@ namespace
     stayAwakeWifiFailureStartedAt = 0;
   }
 
+  void resetConsecutiveWifiFailures()
+  {
+    if (consecutiveWifiFailedWakeCycles == 0)
+    {
+      return;
+    }
+
+    consecutiveWifiFailedWakeCycles = 0;
+    if (appPreferences.putUChar(WIFI_FAILURE_COUNT_KEY, 0) != sizeof(uint8_t))
+    {
+      Serial.println("PERINGATAN: counter kegagalan Wi-Fi gagal di-reset.");
+    }
+    else
+    {
+      Serial.println("Wi-Fi tersambung; counter kegagalan wake di-reset.");
+    }
+  }
+
+  bool recordFailedWifiWakeCycle()
+  {
+    if (consecutiveWifiFailedWakeCycles <
+        WIFI_FAILURES_BEFORE_PROVISIONING)
+    {
+      ++consecutiveWifiFailedWakeCycles;
+    }
+
+    if (appPreferences.putUChar(WIFI_FAILURE_COUNT_KEY,
+                                consecutiveWifiFailedWakeCycles) !=
+        sizeof(uint8_t))
+    {
+      Serial.println("PERINGATAN: counter kegagalan Wi-Fi gagal disimpan.");
+    }
+
+    Serial.printf("Wake tanpa Wi-Fi: %u/%u kegagalan berturut-turut.\n",
+                  consecutiveWifiFailedWakeCycles,
+                  WIFI_FAILURES_BEFORE_PROVISIONING);
+    return consecutiveWifiFailedWakeCycles >=
+           WIFI_FAILURES_BEFORE_PROVISIONING;
+  }
+
+  void serviceSuccessfulWifiConnection()
+  {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      resetConsecutiveWifiFailures();
+    }
+  }
+
   void serviceStayAwakeWifiProvisioningFallback()
   {
+    // This interval also runs from inside Edgent's blocking connection loops,
+    // so a brief successful association resets failures before any later
+    // cloud timeout can be mistaken for a Wi-Fi failure.
+    serviceSuccessfulWifiConnection();
+
     // Automatic re-provisioning is deliberately exclusive to Stay Awake.
     // Normal wake cycles must keep their saved credentials, time out, queue
     // telemetry, and sleep when either Wi-Fi or the internet is unavailable.
@@ -1632,6 +1868,28 @@ namespace
     }
 
     edgentConnectTimeoutArmed = false;
+
+    if (WiFi.status() != WL_CONNECTED && recordFailedWifiWakeCycle())
+    {
+      edgentConnectTimedOut = false;
+      provisioningRequested = true;
+      Blynk.disconnect();
+      WiFi.disconnect();
+      Serial.println("Tiga wake berturut-turut gagal menyambung Wi-Fi; "
+                     "membuka access point Blynk dan tetap terjaga.");
+      // Do not erase the previous configuration until a replacement is
+      // submitted. A successful Edgent connection returns to normal V17=0.
+      BlynkState::set(MODE_WAIT_CONFIG);
+      return;
+    }
+
+    // Reaching Wi-Fi but not Blynk Cloud is an internet/cloud failure, not a
+    // credential failure, so it breaks the consecutive Wi-Fi failure streak.
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      resetConsecutiveWifiFailures();
+    }
+
     edgentConnectTimedOut = true;
     Blynk.disconnect();
     WiFi.disconnect();
@@ -1724,8 +1982,8 @@ namespace
     else
     {
       const uint32_t fallbackSleepMs =
-          activeDurationMs < MEASUREMENT_INTERVAL_MS
-              ? MEASUREMENT_INTERVAL_MS - activeDurationMs
+          activeDurationMs < measurementIntervalSeconds * 1000UL
+              ? measurementIntervalSeconds * 1000UL - activeDurationMs
               : MINIMUM_SLEEP_MS;
       sleepDurationUs = static_cast<uint64_t>(fallbackSleepMs) * 1000ULL;
       Serial.printf("Siklus selesai dalam %lu ms; NTP belum tersedia; "
@@ -1769,6 +2027,7 @@ BLYNK_CONNECTED()
     Serial.println("Konfigurasi Edgent tervalidasi; koneksi Blynk aktif.");
   }
   clearStayAwakeWifiFailureTracking();
+  resetConsecutiveWifiFailures();
   blynkConnectedAt = millis();
   serviceNetworkTime();
   v6SyncReceived = false;
@@ -1797,7 +2056,7 @@ BLYNK_WRITE(V9)
 
 BLYNK_WRITE(V10)
 {
-  handleMqttTerminalCommand(param.asStr());
+  handleTerminalCommand(param.asStr());
 }
 
 BLYNK_WRITE(V17)
@@ -1893,7 +2152,16 @@ void setup()
 
   appPreferences.begin("tidal", false);
   loadMqttHostConfiguration();
+  loadMeasurementTimingConfiguration();
   deepSleepDisabled = appPreferences.getBool(STAY_AWAKE_KEY, false);
+  consecutiveWifiFailedWakeCycles =
+      appPreferences.getUChar(WIFI_FAILURE_COUNT_KEY, 0);
+  if (consecutiveWifiFailedWakeCycles >
+      WIFI_FAILURES_BEFORE_PROVISIONING)
+  {
+    consecutiveWifiFailedWakeCycles = 0;
+    appPreferences.putUChar(WIFI_FAILURE_COUNT_KEY, 0);
+  }
   const uint32_t storedSensorHeightMm =
       appPreferences.getUInt("sensor_h_mm", DEFAULT_SENSOR_HEIGHT_MM);
   const uint32_t minimumSensorHeightMm =
@@ -1961,10 +2229,16 @@ void setup()
   Serial.printf("Tinggi referensi sensor awal: %lu mm\n",
                 static_cast<unsigned long>(sensorHeightMm));
   Serial.println("Provisioning Wi-Fi dan koneksi cloud dikelola Blynk.Edgent.");
-  Serial.println("Jadwal UTC absolut 5 menit aktif setelah waktu NTP tersedia.");
+  Serial.printf("Jadwal UTC absolut %lu detik aktif setelah waktu NTP tersedia.\n",
+                static_cast<unsigned long>(measurementIntervalSeconds));
+  Serial.printf("Jendela pengumpulan A02YYUW: %lu detik; semua frame valid diproses.\n",
+                static_cast<unsigned long>(collectionWindowSeconds));
   Serial.printf("V17 Stay Awake tersimpan: %s (deep sleep %s).\n",
                 deepSleepDisabled ? "ON" : "OFF",
                 deepSleepDisabled ? "nonaktif" : "aktif");
+  Serial.printf("Counter wake gagal Wi-Fi: %u/%u.\n",
+                consecutiveWifiFailedWakeCycles,
+                WIFI_FAILURES_BEFORE_PROVISIONING);
 
   if (!writeRegister16(REG_CONFIG, INA3221_CONFIG_ALL_CHANNELS_CONTINUOUS))
   {
@@ -2000,6 +2274,7 @@ void setup()
 void loop()
 {
   serviceNetworkTime();
+  serviceSuccessfulWifiConnection();
   if (telemetryUsesMqtt() && mqttInitialized)
   {
     mqttTelemetry->service(WiFi.status() == WL_CONNECTED);
@@ -2131,12 +2406,13 @@ void loop()
     return;
   }
 
-  // Tanpa deep sleep, mulai siklus pengukuran baru setiap lima menit tanpa
+  // Tanpa deep sleep, mulai siklus baru pada interval yang dikonfigurasi tanpa
   // me-restart ESP32. Jalur provisioning di atas tetap memiliki prioritas.
   if (deepSleepDisabled && otherMeasurementsComplete &&
       stayAwakeCycleIsDue())
   {
-    Serial.println("V17 Stay Awake aktif: memulai slot 5 menit berikutnya.");
+    Serial.printf("V17 Stay Awake aktif: memulai slot %lu detik berikutnya.\n",
+                  static_cast<unsigned long>(measurementIntervalSeconds));
     startNormalMeasurementCycle();
     return;
   }

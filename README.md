@@ -9,16 +9,17 @@ Monitor dan dikirim ke dashboard Blynk melalui Wi-Fi.
 - Membaca tegangan solar cell pada INA3221 channel 1.
 - Membaca tegangan baterai pada INA3221 channel 2.
 - Membaca tegangan dan arus sistem 5 V pada INA3221 channel 3.
-- Memfilter 50 sampel processed-mode A02YYUW dengan median, MAD, dan 10%
+- Memfilter seluruh sampel processed-mode A02YYUW selama jendela waktu yang
+  dikonfigurasi dengan median, MAD, dan 10%
   trimmed mean.
 - Mengontrol catu A02YYUW melalui load switch BS250 dan PN2222A pada D0.
 - Membaca suhu dan kelembapan menggunakan Fermion DFRobot SHT40.
 - Menghitung ketinggian air terhadap datum/titik nol pengukuran.
 - Menyinkronkan waktu UTC melalui NTP dan menjadwalkan pengukuran pada batas
-  absolut 5 menit (`00`, `05`, `10`, dan seterusnya).
-- Menggunakan interval relatif 5 menit sebagai fallback apabila waktu UTC belum
-  tersedia.
-- Menyimpan maksimal 8.064 record (28 hari) pada ring buffer LittleFS sebelum
+  interval yang dapat dikonfigurasi (default 10 menit).
+- Menggunakan interval relatif yang sama sebagai fallback apabila waktu UTC
+  belum tersedia.
+- Menyimpan maksimal 8.064 record (56 hari pada interval default) pada ring buffer LittleFS sebelum
   mencoba upload ke cloud.
 - Mengirim ulang backlog dengan timestamp asli dan menghapus record hanya setelah
   sequence V21 terkonfirmasi dari Blynk.
@@ -90,7 +91,8 @@ boot atau GPIO belum aktif. Periksa pinout fisik BS250 dan PN2222A yang digunaka
 karena urutan kaki dapat berbeda antarprodusen. Firmware menetapkan D0 LOW saat
 boot; D0 HIGH mengaktifkan PN2222A, menarik gate BS250 ke bawah, dan menyalakan
 A02YYUW. Pada siklus otomatis, firmware menunggu warm-up 1 detik, membuang lima
-frame awal, lalu mengumpulkan 50 sampel sebelum kembali mematikan sensor.
+frame awal, lalu mengumpulkan seluruh sampel selama jendela waktu sebelum
+kembali mematikan sensor.
 
 UART menggunakan 9600 baud, 8 data bit, tanpa parity, dan 1 stop bit. Program
 memvalidasi header `0xFF` dan checksum sebelum memakai data jarak.
@@ -105,8 +107,9 @@ dapat bergerak akibat gelombang. D6 XIAO dicadangkan sebagai TX UART oleh
 program, tetapi tidak perlu dihubungkan ke RX sensor ketika memakai mode
 processed value.
 
-Akuisisi dibatasi 20 detik agar sensor yang gagal tidak membuat perangkat terus
-aktif. Setelah pemeriksaan checksum dan rentang 30–4500 mm, firmware menghitung
+Akuisisi berlangsung 60 detik secara default agar gelombang terwakili tanpa
+membuat perangkat terus aktif. Batas ini dapat diubah dari Terminal V10. Setelah
+pemeriksaan checksum dan rentang 30–4500 mm, firmware menghitung
 median dan Median Absolute Deviation (MAD). Sampel dipertahankan apabila:
 
 ```text
@@ -149,9 +152,9 @@ setiap hasil pembacaan.
 | V7 | Suhu SHT40 | Double | °C | Suhu lingkungan hasil pengukuran SHT40. |
 | V8 | Kelembapan SHT40 | Double | %RH | Kelembapan relatif hasil pengukuran SHT40. |
 | V9 | A02YYUW Power | Integer | 0/1 | Status dan kontrol manual load switch A02YYUW selama perangkat terbangun. |
-| V10 | MQTT Terminal | String | - | Terminal perintah untuk melihat, mengganti, dan menerapkan alamat IPv4 broker MQTT. |
+| V10 | Device Terminal | String | - | Terminal perintah untuk konfigurasi MQTT dan waktu pengukuran. |
 | V11 | Measurement Quality | Integer | 0/1/2 | Kualitas hasil A02YYUW: 0 INVALID, 1 POOR, atau 2 GOOD. |
-| V12 | Samples Acquired | Integer | count | Jumlah sampel A02YYUW valid yang berhasil dikumpulkan, maksimal 50. |
+| V12 | Samples Acquired | Integer | count | Jumlah seluruh sampel A02YYUW valid yang terkumpul selama duration. Gunakan rentang hingga 4095. |
 | V13 | Samples Used | Integer | count | Jumlah sampel yang dipakai dalam trimmed mean setelah filter MAD dan trimming. |
 | V14 | MAD Outliers | Integer | count | Jumlah sampel yang ditolak sebagai outlier oleh filter MAD. |
 | V15 | Distance MAD | Double | mm | Ukuran kestabilan/sebaran jarak terhadap median; semakin kecil semakin stabil. |
@@ -187,12 +190,19 @@ portal. Fallback ini hanya dipicu ketika ESP32 tidak tersambung ke Wi-Fi. Jika
 Wi-Fi tersambung tetapi internet atau Blynk Cloud sedang offline, konfigurasi
 Wi-Fi tidak dihapus.
 
-Saat V17 bernilai `0`, perilaku siklus hemat daya tidak berubah: perangkat
-mencoba koneksi dalam jendela aktif yang dibatasi, menyimpan record yang belum
-terkirim, lalu deep sleep dan mencoba lagi pada wake berikutnya. Kegagalan Wi-Fi
-atau internet pada mode ini tidak otomatis membuka AP dan tidak menghapus
-kredensial. Provisioning pertama dan reset manual dengan tombol BOOT tetap
-menahan perangkat dalam portal sampai konfigurasi selesai.
+Saat V17 bernilai `0`, dua wake pertama yang gagal tersambung ke Wi-Fi tetap
+memakai perilaku hemat daya: perangkat menyimpan record yang belum terkirim,
+deep sleep, lalu mencoba lagi pada wake berikutnya. Pada kegagalan Wi-Fi ketiga
+secara berturut-turut, perangkat membuka access point provisioning Blynk dan
+tetap terjaga agar dapat dikonfigurasi di lokasi baru. Counter disimpan di NVS
+agar tidak hilang selama deep sleep. Setiap koneksi Wi-Fi yang berhasil me-reset
+counter, meskipun internet atau Blynk Cloud sedang offline. Konfigurasi lama
+tidak dihapus ketika AP otomatis dibuka; setelah konfigurasi baru berhasil dan
+V17 tetap `0`, perangkat kembali ke jadwal ukur/deep sleep normal.
+
+Provisioning pertama dan reset manual dengan tombol BOOT tetap menahan perangkat
+dalam portal sampai konfigurasi selesai. Kegagalan internet saja tidak dihitung
+sebagai kegagalan Wi-Fi dan tidak membuka portal otomatis.
 
 Untuk V18, buat Datastream String dan hubungkan ke widget Label atau Value
 Display. Firmware memperbarui V18 setiap kali berhasil tersambung ke Blynk agar
@@ -211,6 +221,10 @@ mqtt show
 mqtt set 192.168.1.50
 mqtt apply
 mqtt reset
+measure show
+measure interval 600
+measure duration 60
+measure reset
 ```
 
 `mqtt set` hanya menerima satu alamat IPv4 unicast dan menyimpannya ke NVS;
@@ -221,7 +235,23 @@ dipakai. `mqtt reset` menghapus override dan mengembalikan `MQTT_HOST` dari
 Terminal ketika perangkat sedang online; untuk konfigurasi lebih nyaman,
 aktifkan V17 **Stay Awake** sementara lalu kembalikan ke `0` setelah selesai.
 
-Untuk V19, gunakan rentang `-1` sampai `8064`. Untuk V20 dan V21, gunakan rentang
+`measure interval <seconds>` mengatur jarak antar-siklus pengukuran dari `60`
+sampai `86400` detik. `measure duration <seconds>` mengatur jendela maksimum
+pengumpulan A02YYUW dari `5` sampai `120` detik. Interval harus selalu minimal
+30 detik lebih panjang daripada duration agar ada waktu untuk pengukuran lain,
+koneksi, dan upload. Nilai disimpan ke NVS dan berlaku untuk siklus berikutnya;
+`measure reset` mengembalikan interval `600` detik dan duration `60` detik.
+
+Duration menentukan lamanya jendela pengumpulan setelah warm-up. Firmware
+membuang lima frame awal, lalu menyimpan semua frame valid sampai duration
+berakhir. Seluruh kumpulan tersebut masuk perhitungan median, MAD, penolakan
+outlier, dan trimmed mean. Duration yang lebih panjang biasanya menaikkan V12
+**Samples Acquired**. Jika hasil akhirnya kurang dari 30 sampel/inlier, kualitas
+dinyatakan `INVALID` dan V1/V2 tidak diperbarui.
+
+Gunakan rentang `0` sampai `4095` untuk V12, V13, dan V14 agar counter dari
+jendela pengumpulan panjang tidak terpotong di Blynk. Untuk V19, gunakan rentang
+`-1` sampai `8064`. Untuk V20 dan V21, gunakan rentang
 `0` sampai `2147483647`. Aktifkan **Sync with latest server value** pada V21.
 V21 wajib tersedia karena firmware menyinkronkannya kembali sebagai acknowledgement
 setelah setiap upload. V19 dan V20 dapat ditampilkan menggunakan Value Display;
@@ -232,8 +262,8 @@ Arti V11:
 | Nilai | Status | Kriteria ringkas |
 |---|---|---|
 | 0 | INVALID | Kurang dari 30 sampel atau inlier; V1/V2 tidak diperbarui |
-| 1 | POOR | Hasil dapat dihitung, tetapi target/kualitas GOOD tidak terpenuhi |
-| 2 | GOOD | 50 sampel, minimal 40 inlier, MAD maksimal 30 mm, dan frame valid minimal 90% |
+| 1 | POOR | Hasil dapat dihitung, tetapi kriteria kestabilan/inlier GOOD tidak terpenuhi |
+| 2 | GOOD | Buffer tidak penuh, minimal 80% sampel menjadi inlier, MAD maksimal 30 mm, dan frame valid minimal 90% |
 
 V12 adalah sampel valid secara protokol/rentang yang berhasil dikumpulkan. V13
 adalah jumlah sampel yang benar-benar masuk trimmed mean. V14 hanya menghitung
@@ -276,11 +306,11 @@ konfigurasi dan kembali ke mode provisioning, tahan tombol BOOT (GPIO0) sekitar
 
 ## Siklus operasi dan OTA
 
-Urutan normal setiap lima menit:
+Urutan normal setiap interval pengukuran (default sepuluh menit):
 
 1. Bangun dari timer deep sleep.
 2. Tetapkan D0 HIGH dan tunggu A02YYUW stabil selama 1 detik.
-3. Buang 5 frame awal, kumpulkan maksimal 50 sampel, lalu lakukan filtering.
+3. Buang 5 frame awal, kumpulkan seluruh sampel selama duration (default 60 detik), lalu lakukan filtering.
 4. Tetapkan D0 LOW dan tahan pin LOW selama deep sleep.
 5. Baca SHT40 serta seluruh pengukuran INA3221 yang digunakan firmware.
 6. Simpan record bertimestamp ke ring buffer LittleFS sebelum mencoba internet.
@@ -294,14 +324,14 @@ Urutan normal setiap lima menit:
 10. Sinkronkan V21 dan hapus record hanya jika sequence yang diterima sama dengan
     sequence yang baru dikirim.
 11. Tetap online selama 15 detik sebagai jendela penerimaan Blynk.Air OTA.
-12. Jika waktu UTC valid, deep sleep sampai batas absolut lima menit berikutnya.
-    Jika waktu belum valid, gunakan sisa interval relatif lima menit.
+12. Jika waktu UTC valid, deep sleep sampai batas interval absolut berikutnya.
+    Jika waktu belum valid, gunakan sisa interval relatif yang dikonfigurasi.
 
 Jika V17 bernilai `1`, langkah deep sleep dilewati. Perangkat tetap melayani
-Blynk.Edgent dan memulai pengukuran baru pada batas absolut 5 menit tanpa
-restart. Jika waktu UTC belum tersedia, mode ini kembali memakai interval
-relatif. Ubah V17 menjadi `0` untuk memulihkan deep sleep setelah siklus aktif
-selesai.
+Blynk.Edgent dan memulai pengukuran baru pada batas absolut interval yang
+dikonfigurasi tanpa restart. Jika waktu UTC belum tersedia, mode ini kembali
+memakai interval relatif. Ubah V17 menjadi `0` untuk memulihkan deep sleep
+setelah siklus aktif selesai.
 
 ### Waktu NTP dan jadwal absolut
 
@@ -310,8 +340,9 @@ atau perubahan konfigurasi lokal. Server yang dicoba adalah `pool.ntp.org`,
 `time.google.com`, dan `time.cloudflare.com`. Permintaan NTP berjalan setelah
 Wi-Fi tersambung dan tidak menambah proses blocking baru ke siklus Edgent.
 
-Setelah waktu valid, awal siklus diarahkan ke timestamp yang habis dibagi 300
-detik. Contohnya: `00:00`, `00:05`, `00:10`, dan seterusnya. RTC internal ESP32
+Setelah waktu valid, awal siklus diarahkan ke timestamp yang habis dibagi interval
+yang dikonfigurasi. Pada default 600 detik contohnya adalah `00:00`, `00:10`,
+`00:20`, dan seterusnya. RTC internal ESP32
 mempertahankan acuan waktu selama deep sleep, sedangkan koneksi berikutnya
 memulai sinkronisasi NTP kembali untuk mengoreksi drift.
 
@@ -322,9 +353,11 @@ sampai NTP berhasil kembali.
 
 ### Buffer offline bertimestamp
 
-Firmware `1.4.0` menyimpan setiap hasil pengukuran sebagai record biner 66 byte
-dengan checksum. Ring buffer berkapasitas 8.064 record, setara 28 hari pada
-interval lima menit, dan menggunakan sekitar 520 KiB dari partisi filesystem
+Firmware menyimpan setiap hasil pengukuran sebagai record biner 66 byte dengan
+checksum. Schema record v2 memadatkan counter sampel yang lebih besar ke layout
+yang sama dan firmware tetap dapat membaca record v1 yang sudah mengantre.
+Ring buffer berkapasitas 8.064 record, setara 56 hari pada
+interval default sepuluh menit, dan menggunakan sekitar 520 KiB dari partisi filesystem
 1,5 MiB. Dua salinan metadata dipakai bergantian agar metadata sebelumnya tetap
 tersedia jika daya terputus saat penulisan.
 
@@ -442,10 +475,10 @@ Contoh output:
 
 ```text
 A02YYUW ON: D0/GPIO 1 HIGH, warm-up 1000 ms.
-A02YYUW warm-up selesai; buang 5 frame lalu ambil 50 sampel processed-mode.
-A02YYUW: 10/50 sampel terkumpul.
+A02YYUW warm-up selesai; buang 5 frame lalu kumpulkan semua sampel selama 60 detik.
+A02YYUW: 100 sampel terkumpul.
 ...
-A02YYUW: 50/50 sampel terkumpul.
+A02YYUW: 600 sampel terkumpul.
 A02YYUW OFF: D0/GPIO 1 LOW.
 Hasil filter A02YYUW:
   acquired=50, used=44, outlier=2, checksum_error=0, range_error=0
@@ -476,7 +509,7 @@ Siklus selesai dalam 38000 ms; deep sleep 18000 ms; bangun pada 2026-08-07 12:05
   9600, ground bersama, objek berada dalam rentang sensor, D0 berstatus HIGH,
   serta tegangan 5 V benar-benar muncul pada output load switch.
 - **Quality selalu INVALID:** periksa V12/V13, checksum/range error pada Serial,
-  arah sensor, bidang pantul, dan apakah 20 detik cukup untuk menghasilkan
+  arah sensor, bidang pantul, dan apakah duration yang dikonfigurasi cukup untuk menghasilkan
   minimal 30 sampel processed-mode.
 - **Load switch terbalik atau selalu aktif:** periksa pinout BS250/PN2222A,
   resistor base PN2222A, resistor pull-up gate BS250, dan kesamaan ground.
@@ -560,8 +593,8 @@ disimpan dalam file kecil terpisah pada LittleFS yang sama, sehingga file queue
 lama tetap kompatibel dan ukuran per record tidak berubah. Jika salah satu
 tujuan offline terus-menerus,
 tujuan yang sehat tetap menerima data baru sementara backlog dipertahankan
-untuk tujuan yang gagal. Pada interval lima menit, queue mencapai kapasitas
-sekitar 28 hari sebelum kebijakan drop-oldest berlaku.
+untuk tujuan yang gagal. Pada interval default sepuluh menit, queue mencapai
+kapasitas sekitar 56 hari sebelum kebijakan drop-oldest berlaku.
 
 Contoh konfigurasi dashboard:
 

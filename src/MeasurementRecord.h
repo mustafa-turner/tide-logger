@@ -41,4 +41,45 @@ struct __attribute__((packed)) MeasurementRecord {
 static_assert(sizeof(MeasurementRecord) == 66,
               "MeasurementRecord layout changed unexpectedly");
 
+// Schema v2 packs acquired and inlier counts as two 12-bit integers into the
+// three legacy uint8_t sample fields. This preserves the durable 66-byte queue
+// layout while allowing a full timed acquisition to exceed 255 samples.
+inline void setMeasurementSampleCounts(MeasurementRecord &record,
+                                       uint16_t acquired,
+                                       uint16_t inliers) {
+  record.schemaVersion = 2;
+  record.acquiredSamples = static_cast<uint8_t>(acquired & 0xFFU);
+  record.usedSamples = static_cast<uint8_t>(((acquired >> 8U) & 0x0FU) |
+                                             ((inliers & 0x0FU) << 4U));
+  record.outlierSamples = static_cast<uint8_t>((inliers >> 4U) & 0xFFU);
+}
+
+inline uint16_t measurementAcquiredSamples(const MeasurementRecord &record) {
+  if (record.schemaVersion < 2) return record.acquiredSamples;
+  return static_cast<uint16_t>(record.acquiredSamples) |
+         (static_cast<uint16_t>(record.usedSamples & 0x0FU) << 8U);
+}
+
+inline uint16_t measurementInlierSamples(const MeasurementRecord &record) {
+  if (record.schemaVersion < 2) {
+    return record.acquiredSamples >= record.outlierSamples
+               ? record.acquiredSamples - record.outlierSamples
+               : 0;
+  }
+  return static_cast<uint16_t>((record.usedSamples >> 4U) & 0x0FU) |
+         (static_cast<uint16_t>(record.outlierSamples) << 4U);
+}
+
+inline uint16_t measurementUsedSamples(const MeasurementRecord &record) {
+  if (record.schemaVersion < 2) return record.usedSamples;
+  const uint16_t inliers = measurementInlierSamples(record);
+  return inliers - 2U * (inliers / 10U);
+}
+
+inline uint16_t measurementOutlierSamples(const MeasurementRecord &record) {
+  const uint16_t acquired = measurementAcquiredSamples(record);
+  const uint16_t inliers = measurementInlierSamples(record);
+  return acquired >= inliers ? acquired - inliers : 0;
+}
+
 }  // namespace tide
