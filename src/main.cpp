@@ -5,7 +5,7 @@
 #include "TelemetryPayload.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.4.0"
+#define BLYNK_FIRMWARE_VERSION "1.4.1"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
