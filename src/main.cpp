@@ -6,7 +6,7 @@
 #include "TelemetryPayload.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.4.3"
+#define BLYNK_FIRMWARE_VERSION "1.5.0"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -1657,7 +1657,7 @@ namespace
     }
 
     if (millis() - a02AcquisitionStartedAt >=
-            collectionWindowSeconds * 1000UL)
+        collectionWindowSeconds * 1000UL)
     {
       finalizeA02YYUWMeasurement();
     }
