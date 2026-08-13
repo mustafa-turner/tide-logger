@@ -6,7 +6,7 @@
 #include "TelemetryPayload.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.5.0"
+#define BLYNK_FIRMWARE_VERSION "1.6.0"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -69,6 +69,10 @@ namespace
   constexpr uint32_t EDGENT_CONNECT_TIMEOUT_MS = 15000;
   constexpr uint32_t STAY_AWAKE_WIFI_REPROVISION_MS = 2UL * 60UL * 1000UL;
   constexpr uint32_t WIFI_FALLBACK_SERVICE_INTERVAL_MS = 1000;
+  constexpr uint32_t PROVISIONING_MEASUREMENT_SERVICE_INTERVAL_MS = 10;
+  constexpr uint32_t SAVED_WIFI_SCAN_INTERVAL_MS = 30UL * 1000UL;
+  constexpr uint32_t SAVED_WIFI_SCAN_TIMEOUT_MS = 20UL * 1000UL;
+  constexpr uint32_t SAVED_WIFI_CONNECT_TIMEOUT_MS = 15UL * 1000UL;
   constexpr uint32_t BLYNK_SYNC_FALLBACK_MS = 3000;
   constexpr uint32_t OTA_LISTEN_WINDOW_MS = 15000;
   constexpr uint32_t MINIMUM_SLEEP_MS = 1000;
@@ -88,6 +92,7 @@ namespace
   constexpr char MEASUREMENT_INTERVAL_KEY[] = "measure_s";
   constexpr char COLLECTION_WINDOW_KEY[] = "collect_s";
   constexpr char MQTT_HOST_KEY[] = "mqtt_host";
+  constexpr char TELEMETRY_MODE_KEY[] = "telemetry_mode";
   // Preserve support for a full DNS hostname in device_config.h, even though
   // runtime changes from Blynk intentionally accept IPv4 addresses only.
   constexpr size_t MQTT_HOST_CAPACITY = 256;
@@ -168,6 +173,9 @@ namespace
   bool edgentConnectTimeoutArmed = false;
   bool edgentConnectTimedOut = false;
   bool provisioningRequested = false;
+  bool fallbackProvisioningActive = false;
+  bool fallbackSavedConfigAvailable = false;
+  ConfigStore fallbackSavedConfig = {};
   bool stayAwakeWifiFailureTracked = false;
   uint8_t consecutiveWifiFailedWakeCycles = 0;
   bool cycleUploaded = false;
@@ -176,6 +184,9 @@ namespace
   bool deepSleepDisabled = false;
   uint32_t edgentConnectStartedAt = 0;
   uint32_t stayAwakeWifiFailureStartedAt = 0;
+  uint32_t lastSavedWifiScanAt = 0;
+  uint32_t savedWifiScanStartedAt = 0;
+  uint32_t savedWifiConnectStartedAt = 0;
   uint32_t blynkConnectedAt = 0;
   uint32_t cycleUploadedAt = 0;
   bool ntpSyncRequested = false;
@@ -202,8 +213,20 @@ namespace
   bool pendingUploadAcknowledged = false;
   bool v21SyncReceived = false;
   bool mqttInitialized = false;
+  TelemetryBackend activeTelemetryBackend = TELEMETRY_BACKEND_MODE;
   bool mqttUploadDeadlineArmed = false;
   uint32_t mqttUploadDeadlineStartedAt = 0;
+  bool cycleStartedDuringProvisioning = false;
+
+  enum class SavedWifiRecoveryState : uint8_t
+  {
+    IDLE,
+    SCANNING,
+    CONNECTING,
+  };
+
+  SavedWifiRecoveryState savedWifiRecoveryState =
+      SavedWifiRecoveryState::IDLE;
 
   enum class OfflineUploadState : uint8_t
   {
@@ -213,6 +236,35 @@ namespace
   };
 
   OfflineUploadState offlineUploadState = OfflineUploadState::IDLE;
+
+  bool telemetryUsesBlynk()
+  {
+    return telemetryBackendUsesBlynk(activeTelemetryBackend);
+  }
+
+  bool telemetryUsesMqtt()
+  {
+    return telemetryBackendUsesMqtt(activeTelemetryBackend);
+  }
+
+  uint16_t telemetryRequiredDeliveryMask()
+  {
+    return telemetryBackendDeliveryMask(activeTelemetryBackend);
+  }
+
+  const char *telemetryModeName()
+  {
+    switch (activeTelemetryBackend)
+    {
+    case TelemetryBackend::BLYNK_ONLY:
+      return "Blynk only";
+    case TelemetryBackend::MQTT_ONLY:
+      return "MQTT only";
+    case TelemetryBackend::BOTH:
+      return "Blynk + MQTT";
+    }
+    return "invalid";
+  }
 
   bool getValidUtcTime(timeval &utcNow)
   {
@@ -431,6 +483,37 @@ namespace
     snprintf(activeMqttHost, sizeof(activeMqttHost), "%s", storedHost.c_str());
   }
 
+  void loadTelemetryBackendConfiguration()
+  {
+    const uint8_t storedMode = appPreferences.getUChar(
+        TELEMETRY_MODE_KEY, static_cast<uint8_t>(TELEMETRY_BACKEND_MODE));
+    if (storedMode == static_cast<uint8_t>(TelemetryBackend::BLYNK_ONLY) ||
+        storedMode == static_cast<uint8_t>(TelemetryBackend::BOTH))
+    {
+      activeTelemetryBackend = static_cast<TelemetryBackend>(storedMode);
+      return;
+    }
+
+    activeTelemetryBackend = TELEMETRY_BACKEND_MODE;
+    Serial.println("Stored telemetry mode is invalid; using device_config.h.");
+  }
+
+  bool ensureMqttInitialized()
+  {
+    if (mqttInitialized)
+    {
+      return true;
+    }
+    if (mqttTelemetry == nullptr)
+    {
+      mqttTelemetry = new (std::nothrow) tide::MqttTelemetry();
+    }
+    mqttInitialized = mqttTelemetry != nullptr &&
+                      mqttTelemetry->begin(TIDE_DEVICE_ID, activeMqttHost,
+                                           MQTT_PORT, ESP.getEfuseMac());
+    return mqttInitialized;
+  }
+
   void blynkTerminalPrintf(const char *format, ...)
   {
     if (!Blynk.connected())
@@ -510,10 +593,14 @@ namespace
     captureCurrentAbsoluteSlot();
   }
 
+  void publishOfflineQueueDiagnostics();
+  void finishUploadWorkForCycle(const char *reason);
+  void setMqttEnabledFromTerminal(bool enabled);
+
   void showTerminalHelp()
   {
     blynkTerminalPrintf(
-        "Commands:\nmqtt show | set <IPv4> | reset | apply\nmeasure show\nmeasure interval <seconds>\nmeasure duration <seconds>\nmeasure reset");
+        "Commands:\nmqtt show | on | off\nmqtt set <IPv4> | reset | apply\nmeasure show\nmeasure interval <seconds>\nmeasure duration <seconds>\nmeasure reset\noffline show | clear");
   }
 
   void handleTerminalCommand(String command)
@@ -615,13 +702,81 @@ namespace
       return;
     }
 
+    if (normalized == "offline show")
+    {
+      if (!offlineQueue.ready())
+      {
+        blynkTerminalPrintf("Offline queue unavailable");
+        return;
+      }
+      blynkTerminalPrintf("Offline records: %lu/%lu\nDropped: %lu",
+                          static_cast<unsigned long>(offlineQueue.count()),
+                          static_cast<unsigned long>(offlineQueue.capacity()),
+                          static_cast<unsigned long>(
+                              offlineQueue.droppedRecords()));
+      return;
+    }
+
+    if (normalized == "offline clear")
+    {
+      if (!offlineQueue.ready())
+      {
+        blynkTerminalPrintf("Error: offline queue unavailable");
+        return;
+      }
+
+      const uint32_t removedRecords = offlineQueue.count();
+      if (!offlineQueue.clear())
+      {
+        blynkTerminalPrintf("Error: offline records were not cleared");
+        return;
+      }
+
+      // Cancel this cycle's local replay bookkeeping. Keep
+      // currentCycleRecordQueued true when applicable so the record explicitly
+      // removed by this command is not silently enqueued again from RAM.
+      offlineUploadState = OfflineUploadState::IDLE;
+      pendingUploadSequence = 0;
+      pendingUploadAcknowledged = false;
+      mqttUploadDeadlineArmed = false;
+      blynkUploadFinishedForCycle = true;
+      mqttUploadFinishedForCycle = true;
+      if (currentCycleRecordReady)
+      {
+        finishUploadWorkForCycle("offline queue cleared from terminal");
+      }
+      else
+      {
+        publishOfflineQueueDiagnostics();
+      }
+      Serial.printf("Offline queue cleared from terminal: %lu records removed.\n",
+                    static_cast<unsigned long>(removedRecords));
+      blynkTerminalPrintf("Cleared %lu offline record%s",
+                          static_cast<unsigned long>(removedRecords),
+                          removedRecords == 1 ? "" : "s");
+      return;
+    }
+
     if (normalized == "mqtt show")
     {
       const String storedHost = appPreferences.getString(MQTT_HOST_KEY, "");
       const char *nextHost = storedHost.isEmpty() ? MQTT_HOST : storedHost.c_str();
-      blynkTerminalPrintf("Active: %s:%u\nNext boot: %s:%u", activeMqttHost,
+      blynkTerminalPrintf("Mode: %s\nActive: %s:%u\nNext boot: %s:%u",
+                          telemetryModeName(), activeMqttHost,
                           static_cast<unsigned>(MQTT_PORT), nextHost,
                           static_cast<unsigned>(MQTT_PORT));
+      return;
+    }
+
+    if (normalized == "mqtt on")
+    {
+      setMqttEnabledFromTerminal(true);
+      return;
+    }
+
+    if (normalized == "mqtt off")
+    {
+      setMqttEnabledFromTerminal(false);
       return;
     }
 
@@ -1220,6 +1375,70 @@ namespace
     buildAndPublishMqttRecord(record);
   }
 
+  void setMqttEnabledFromTerminal(bool enabled)
+  {
+    const TelemetryBackend requestedMode =
+        enabled ? TelemetryBackend::BOTH : TelemetryBackend::BLYNK_ONLY;
+    if (activeTelemetryBackend == requestedMode)
+    {
+      blynkTerminalPrintf("Already using %s",
+                          enabled ? "Blynk + MQTT" : "Blynk only");
+      return;
+    }
+
+    if (appPreferences.putUChar(TELEMETRY_MODE_KEY,
+                                static_cast<uint8_t>(requestedMode)) !=
+        sizeof(uint8_t))
+    {
+      blynkTerminalPrintf("Error: telemetry mode was not saved");
+      return;
+    }
+
+    activeTelemetryBackend = requestedMode;
+    if (enabled)
+    {
+      const bool initialized = ensureMqttInitialized();
+      if (!cycleUploaded)
+      {
+        mqttUploadFinishedForCycle = false;
+        mqttUploadDeadlineArmed = false;
+      }
+      Serial.println("Telemetry mode changed from terminal: Blynk + MQTT.");
+      blynkTerminalPrintf(
+          initialized
+              ? "MQTT enabled: Blynk + MQTT delivery is active"
+              : "MQTT enabled, but initialization failed; retry on next wake");
+      return;
+    }
+
+    if (mqttTelemetry != nullptr)
+    {
+      mqttTelemetry->disable();
+    }
+    mqttUploadFinishedForCycle = true;
+    mqttUploadDeadlineArmed = false;
+
+    uint32_t reconciledRecords = 0;
+    const bool reconciled =
+        !offlineQueue.ready() ||
+        offlineQueue.reconcileDeliveries(telemetryRequiredDeliveryMask(),
+                                         reconciledRecords);
+    if (currentCycleRecordReady && blynkUploadFinishedForCycle)
+    {
+      finishUploadWorkForCycle("MQTT disabled from terminal");
+    }
+    publishOfflineQueueDiagnostics();
+    Serial.printf("Telemetry mode changed from terminal: Blynk only; "
+                  "%lu records reconciled.\n",
+                  static_cast<unsigned long>(reconciledRecords));
+    blynkTerminalPrintf(
+        reconciled
+            ? "MQTT disabled: Blynk-only delivery active; %lu record%s reconciled"
+            : "MQTT disabled, but offline queue reconciliation failed",
+        static_cast<unsigned long>(reconciledRecords),
+        reconciledRecords == 1 ? "" : "s");
+  }
+
   uint8_t sht40Crc(const uint8_t *data, size_t length)
   {
     uint8_t crc = 0xFF;
@@ -1544,6 +1763,7 @@ namespace
   {
     cycleStartedAt = millis();
     normalCycleStarted = true;
+    cycleStartedDuringProvisioning = fallbackProvisioningActive;
     cycleAbsoluteSlotValid = false;
     captureCurrentAbsoluteSlot();
     cycleStartedWithAbsoluteTime = cycleAbsoluteSlotValid;
@@ -1566,7 +1786,6 @@ namespace
     mqttUploadDeadlineStartedAt = 0;
     edgentConnectTimeoutArmed = false;
     edgentConnectTimedOut = false;
-    provisioningRequested = false;
     edgentConnectStartedAt = 0;
     blynkConnectedAt = Blynk.connected() ? millis() : 0;
 
@@ -1584,6 +1803,10 @@ namespace
     setA02YYUWPower(true);
     Serial.printf("Siklus %lu detik dimulai: mengukur sebelum koneksi cloud.\n",
                   static_cast<unsigned long>(measurementIntervalSeconds));
+    if (cycleStartedDuringProvisioning)
+    {
+      Serial.println("Provisioning active: scheduled measurement cycle started.");
+    }
   }
 
   void serviceAutomaticA02YYUWMeasurement()
@@ -1727,6 +1950,20 @@ namespace
       Serial.println("SHT40: ERROR");
     }
     persistCurrentMeasurement();
+    if (cycleStartedDuringProvisioning)
+    {
+      if (currentCycleRecordQueued)
+      {
+        Serial.println("Scheduled measurement performed while provisioning; "
+                       "record persisted to the offline queue.");
+      }
+      else
+      {
+        Serial.println("Scheduled measurement performed while provisioning; "
+                       "offline persistence was unavailable (record remains "
+                       "in RAM).");
+      }
+    }
   }
 
   bool edgentIsConfigured()
@@ -1788,6 +2025,242 @@ namespace
     }
   }
 
+  bool provisioningStateAllowsMeasurements()
+  {
+    return BlynkState::is(MODE_WAIT_CONFIG) ||
+           BlynkState::is(MODE_CONFIGURING) ||
+           BlynkState::is(MODE_SWITCH_TO_STA) ||
+           BlynkState::is(MODE_CONNECTING_NET) ||
+           BlynkState::is(MODE_CONNECTING_CLOUD) ||
+           BlynkState::is(MODE_ERROR);
+  }
+
+  void resetSavedWifiRecovery()
+  {
+    savedWifiRecoveryState = SavedWifiRecoveryState::IDLE;
+    savedWifiScanStartedAt = 0;
+    savedWifiConnectStartedAt = 0;
+  }
+
+  void discardFallbackSavedConfig()
+  {
+    fallbackSavedConfig = {};
+    fallbackSavedConfigAvailable = false;
+  }
+
+  void restoreFallbackSavedConfig(const char *reason)
+  {
+    if (!fallbackSavedConfigAvailable)
+    {
+      return;
+    }
+
+    configStore = fallbackSavedConfig;
+    if (!config_save())
+    {
+      Serial.println("WARNING: failed to restore the last-known Edgent "
+                     "configuration to NVS.");
+    }
+    Serial.printf("Replacement Wi-Fi configuration was not accepted (%s); "
+                  "last-known credentials restored.\n",
+                  reason);
+    resetSavedWifiRecovery();
+    lastSavedWifiScanAt = millis() - SAVED_WIFI_SCAN_INTERVAL_MS;
+    BlynkState::set(MODE_WAIT_CONFIG);
+  }
+
+  void enterProvisioningFallback(const char *reason)
+  {
+    if (!fallbackProvisioningActive && edgentIsConfigured())
+    {
+      fallbackSavedConfig = configStore;
+      fallbackSavedConfigAvailable = true;
+    }
+    provisioningRequested = true;
+    fallbackProvisioningActive = true;
+    edgentConnectTimeoutArmed = false;
+    edgentConnectTimedOut = false;
+    clearStayAwakeWifiFailureTracking();
+    resetSavedWifiRecovery();
+    lastSavedWifiScanAt = millis() - SAVED_WIFI_SCAN_INTERVAL_MS;
+    Blynk.disconnect();
+    WiFi.disconnect(false, false);
+    Serial.printf("Provisioning fallback entered: %s Saved Wi-Fi credentials "
+                  "were preserved.\n",
+                  reason);
+    BlynkState::set(MODE_WAIT_CONFIG);
+  }
+
+  void serviceSavedWifiRecovery()
+  {
+    if (!fallbackProvisioningActive || !provisioningRequested)
+    {
+      resetSavedWifiRecovery();
+      return;
+    }
+
+    // Edgent stores portal candidates in configStore before validation. If a
+    // candidate fails, its stock error path may persist defaults; restore the
+    // fallback snapshot before reopening the portal.
+    if (!edgentIsConfigured() && BlynkState::is(MODE_ERROR))
+    {
+      restoreFallbackSavedConfig("connection validation failed");
+      return;
+    }
+    if (!edgentIsConfigured() && BlynkState::is(MODE_WAIT_CONFIG))
+    {
+      restoreFallbackSavedConfig("cloud or token validation failed");
+      return;
+    }
+    if (!edgentIsConfigured())
+    {
+      resetSavedWifiRecovery();
+      return;
+    }
+
+    // Let an attached technician finish interacting with the portal. Recovery
+    // resumes as soon as Edgent returns from MODE_CONFIGURING to WAIT_CONFIG.
+    if (BlynkState::is(MODE_CONFIGURING))
+    {
+      return;
+    }
+    if (!BlynkState::is(MODE_WAIT_CONFIG))
+    {
+      resetSavedWifiRecovery();
+      return;
+    }
+
+    if (savedWifiRecoveryState == SavedWifiRecoveryState::IDLE)
+    {
+      if (millis() - lastSavedWifiScanAt < SAVED_WIFI_SCAN_INTERVAL_MS)
+      {
+        return;
+      }
+
+      lastSavedWifiScanAt = millis();
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.scanDelete();
+      const int16_t scanStart = WiFi.scanNetworks(true, true);
+      if (scanStart == WIFI_SCAN_FAILED)
+      {
+        Serial.println("Saved Wi-Fi scan could not be started; will retry.");
+        return;
+      }
+      savedWifiScanStartedAt = millis();
+      savedWifiRecoveryState = SavedWifiRecoveryState::SCANNING;
+      return;
+    }
+
+    if (savedWifiRecoveryState == SavedWifiRecoveryState::SCANNING)
+    {
+      const int16_t networkCount = WiFi.scanComplete();
+      if (networkCount == WIFI_SCAN_RUNNING)
+      {
+        if (millis() - savedWifiScanStartedAt >= SAVED_WIFI_SCAN_TIMEOUT_MS)
+        {
+          WiFi.scanDelete();
+          Serial.println("Saved Wi-Fi scan timed out; will retry.");
+          resetSavedWifiRecovery();
+        }
+        return;
+      }
+      if (networkCount == WIFI_SCAN_FAILED)
+      {
+        Serial.println("Saved Wi-Fi scan failed; will retry.");
+        resetSavedWifiRecovery();
+        return;
+      }
+
+      bool savedSsidFound = false;
+      for (int16_t index = 0; index < networkCount; ++index)
+      {
+        if (WiFi.SSID(index) == configStore.wifiSSID)
+        {
+          savedSsidFound = true;
+          break;
+        }
+      }
+      WiFi.scanDelete();
+
+      if (!savedSsidFound)
+      {
+        resetSavedWifiRecovery();
+        return;
+      }
+
+      Serial.printf("Saved SSID detected again: %s.\n", configStore.wifiSSID);
+      if (configStore.getFlag(CONFIG_FLAG_STATIC_IP) &&
+          !WiFi.config(configStore.staticIP, configStore.staticGW,
+                       configStore.staticMask, configStore.staticDNS,
+                       configStore.staticDNS2))
+      {
+        Serial.println("Automatic reconnect failure: saved static IP "
+                       "configuration could not be applied.");
+        resetSavedWifiRecovery();
+        return;
+      }
+
+      Serial.printf("Automatic reconnect attempt using saved credentials for "
+                    "%s.\n",
+                    configStore.wifiSSID);
+      WiFi.begin(configStore.wifiSSID, configStore.wifiPass);
+      savedWifiConnectStartedAt = millis();
+      savedWifiRecoveryState = SavedWifiRecoveryState::CONNECTING;
+      return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.printf("Automatic reconnect success: %s connected.\n",
+                    configStore.wifiSSID);
+      provisioningRequested = false;
+      fallbackProvisioningActive = false;
+      discardFallbackSavedConfig();
+      clearStayAwakeWifiFailureTracking();
+      resetConsecutiveWifiFailures();
+      resetSavedWifiRecovery();
+      WiFi.softAPdisconnect(false);
+      WiFi.mode(WIFI_STA);
+      BlynkState::set(MODE_CONNECTING_CLOUD);
+      Serial.println("Provisioning exited after recovery; resuming normal "
+                     "Blynk/MQTT operation.");
+      return;
+    }
+
+    if (millis() - savedWifiConnectStartedAt >=
+        SAVED_WIFI_CONNECT_TIMEOUT_MS)
+    {
+      WiFi.disconnect(false, false);
+      Serial.printf("Automatic reconnect failure: %s did not connect within "
+                    "%lu seconds; provisioning AP remains active.\n",
+                    configStore.wifiSSID,
+                    static_cast<unsigned long>(
+                        SAVED_WIFI_CONNECT_TIMEOUT_MS / 1000UL));
+      resetSavedWifiRecovery();
+      lastSavedWifiScanAt = millis();
+    }
+  }
+
+  void serviceProvisioningMeasurements()
+  {
+    if (!fallbackProvisioningActive || !normalCycleStarted ||
+        !provisioningStateAllowsMeasurements())
+    {
+      return;
+    }
+
+    serviceAutomaticA02YYUWMeasurement();
+    if (automaticMeasurementComplete && !otherMeasurementsComplete)
+    {
+      performOtherCycleMeasurements();
+    }
+
+    if (otherMeasurementsComplete && stayAwakeCycleIsDue())
+    {
+      startNormalMeasurementCycle();
+    }
+  }
+
   void serviceStayAwakeWifiProvisioningFallback()
   {
     // This interval also runs from inside Edgent's blocking connection loops,
@@ -1834,17 +2307,8 @@ namespace
       return;
     }
 
-    clearStayAwakeWifiFailureTracking();
-    provisioningRequested = true;
-    edgentConnectTimeoutArmed = false;
-    edgentConnectTimedOut = false;
-    Blynk.disconnect();
-    WiFi.disconnect();
-    Serial.println("Stay Awake: Wi-Fi tetap gagal; membuka access point Blynk "
-                   "untuk konfigurasi ulang.");
-    // Keep the last-known configuration recoverable until the user actually
-    // submits replacement credentials through the Edgent portal.
-    BlynkState::set(MODE_WAIT_CONFIG);
+    enterProvisioningFallback(
+        "Stay Awake Wi-Fi remained unavailable; opening the Blynk AP.");
   }
 
   bool otaIsPendingOrRunning()
@@ -1871,15 +2335,9 @@ namespace
 
     if (WiFi.status() != WL_CONNECTED && recordFailedWifiWakeCycle())
     {
-      edgentConnectTimedOut = false;
-      provisioningRequested = true;
-      Blynk.disconnect();
-      WiFi.disconnect();
-      Serial.println("Tiga wake berturut-turut gagal menyambung Wi-Fi; "
-                     "membuka access point Blynk dan tetap terjaga.");
-      // Do not erase the previous configuration until a replacement is
-      // submitted. A successful Edgent connection returns to normal V17=0.
-      BlynkState::set(MODE_WAIT_CONFIG);
+      enterProvisioningFallback(
+          "three consecutive wake cycles failed to connect to Wi-Fi; "
+          "opening the Blynk AP and staying awake.");
       return;
     }
 
@@ -2024,6 +2482,9 @@ BLYNK_CONNECTED()
   if (provisioningRequested)
   {
     provisioningRequested = false;
+    fallbackProvisioningActive = false;
+    discardFallbackSavedConfig();
+    resetSavedWifiRecovery();
     Serial.println("Konfigurasi Edgent tervalidasi; koneksi Blynk aktif.");
   }
   clearStayAwakeWifiFailureTracking();
@@ -2152,6 +2613,7 @@ void setup()
 
   appPreferences.begin("tidal", false);
   loadMqttHostConfiguration();
+  loadTelemetryBackendConfiguration();
   loadMeasurementTimingConfiguration();
   deepSleepDisabled = appPreferences.getBool(STAY_AWAKE_KEY, false);
   consecutiveWifiFailedWakeCycles =
@@ -2199,9 +2661,7 @@ void setup()
 
   if (telemetryUsesMqtt())
   {
-    mqttTelemetry = new (std::nothrow) tide::MqttTelemetry();
-    mqttInitialized = mqttTelemetry != nullptr && mqttTelemetry->begin(
-                                                      TIDE_DEVICE_ID, activeMqttHost, MQTT_PORT, ESP.getEfuseMac());
+    ensureMqttInitialized();
     if (!mqttInitialized)
     {
       Serial.println("ERROR MQTT: backend tetap bounded; record tidak akan "
@@ -2212,6 +2672,10 @@ void setup()
   BlynkEdgent.begin();
   edgentTimer.setInterval(WIFI_FALLBACK_SERVICE_INTERVAL_MS,
                           serviceStayAwakeWifiProvisioningFallback);
+  edgentTimer.setInterval(WIFI_FALLBACK_SERVICE_INTERVAL_MS,
+                          serviceSavedWifiRecovery);
+  edgentTimer.setInterval(PROVISIONING_MEASUREMENT_SERVICE_INTERVAL_MS,
+                          serviceProvisioningMeasurements);
   edgentConfiguredAtBoot = edgentIsConfigured();
   provisioningRequested = !edgentConfiguredAtBoot;
   registerA02YYUWConsoleCommand();
@@ -2224,7 +2688,8 @@ void setup()
                 A02YYUW_POWER_PIN);
   Serial.println("Tes Serial: sensor on | sensor off | sensor status");
   Serial.println("Tes Blynk: switch V9 (0=OFF, 1=ON).");
-  Serial.printf("MQTT broker aktif: %s:%u\n", activeMqttHost,
+  Serial.printf("Telemetry mode: %s. MQTT broker: %s:%u\n",
+                telemetryModeName(), activeMqttHost,
                 static_cast<unsigned>(MQTT_PORT));
   Serial.printf("Tinggi referensi sensor awal: %lu mm\n",
                 static_cast<unsigned long>(sensorHeightMm));
@@ -2338,6 +2803,10 @@ void loop()
 
   if (BlynkState::is(MODE_RESET_CONFIG))
   {
+    // An explicit portal/button reset keeps Edgent's existing destructive
+    // reset semantics; only automatic fallback protects the old credentials.
+    fallbackProvisioningActive = false;
+    discardFallbackSavedConfig();
     provisioningRequested = true;
     BlynkEdgent.run();
     return;
@@ -2364,6 +2833,15 @@ void loop()
 
   if (BlynkState::is(MODE_ERROR))
   {
+    if (provisioningRequested)
+    {
+      // Kredensial baru gagal divalidasi: jangan tidur. Bersihkan konfigurasi
+      // yang gagal lalu buka kembali portal Edgent untuk percobaan berikutnya.
+      edgentConnectTimeoutArmed = false;
+      edgentConnectTimedOut = false;
+      BlynkState::set(MODE_RESET_CONFIG);
+      return;
+    }
     if (deepSleepDisabled)
     {
       // enterError() bawaan Edgent akan me-restart MCU. Dalam mode Stay Awake,
@@ -2373,15 +2851,6 @@ void loop()
       Blynk.disconnect();
       WiFi.disconnect();
       BlynkState::set(MODE_CONNECTING_NET);
-      return;
-    }
-    if (provisioningRequested)
-    {
-      // Kredensial baru gagal divalidasi: jangan tidur. Bersihkan konfigurasi
-      // yang gagal lalu buka kembali portal Edgent untuk percobaan berikutnya.
-      edgentConnectTimeoutArmed = false;
-      edgentConnectTimedOut = false;
-      BlynkState::set(MODE_RESET_CONFIG);
       return;
     }
     if (telemetryUsesMqtt() && WiFi.status() == WL_CONNECTED &&
@@ -2408,10 +2877,13 @@ void loop()
 
   // Tanpa deep sleep, mulai siklus baru pada interval yang dikonfigurasi tanpa
   // me-restart ESP32. Jalur provisioning di atas tetap memiliki prioritas.
-  if (deepSleepDisabled && otherMeasurementsComplete &&
+  if ((deepSleepDisabled || fallbackProvisioningActive) &&
+      otherMeasurementsComplete &&
       stayAwakeCycleIsDue())
   {
-    Serial.printf("V17 Stay Awake aktif: memulai slot %lu detik berikutnya.\n",
+    Serial.printf("%s: memulai slot %lu detik berikutnya.\n",
+                  fallbackProvisioningActive ? "Provisioning aktif"
+                                             : "V17 Stay Awake aktif",
                   static_cast<unsigned long>(measurementIntervalSeconds));
     startNormalMeasurementCycle();
     return;

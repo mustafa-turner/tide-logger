@@ -495,6 +495,20 @@ bool OfflineQueue::reconcileDeliveries(uint16_t requiredMask,
   return trimDeliveredRecords(requiredMask, removedRecords);
 }
 
+bool OfflineQueue::clear() {
+  if (!ready_) {
+    return false;
+  }
+
+  // Commit the empty logical range through the same redundant, checksummed
+  // header path used by enqueue/pop. Keep nextSequence monotonic so a delayed
+  // cloud ACK can never match a future record that reused an old sequence.
+  QueueHeader cleared = header_;
+  cleared.head = (cleared.head + cleared.count) % OFFLINE_QUEUE_CAPACITY;
+  cleared.count = 0;
+  return saveHeader(cleared);
+}
+
 DeliveryAcknowledgeResult OfflineQueue::acknowledgeDelivery(
     uint32_t expectedSequence, TelemetryDestination destination,
     uint16_t requiredMask) {

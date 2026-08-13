@@ -152,7 +152,7 @@ setiap hasil pembacaan.
 | V7 | Suhu SHT40 | Double | °C | Suhu lingkungan hasil pengukuran SHT40. |
 | V8 | Kelembapan SHT40 | Double | %RH | Kelembapan relatif hasil pengukuran SHT40. |
 | V9 | A02YYUW Power | Integer | 0/1 | Status dan kontrol manual load switch A02YYUW selama perangkat terbangun. |
-| V10 | Device Terminal | String | - | Terminal perintah untuk konfigurasi MQTT dan waktu pengukuran. |
+| V10 | Device Terminal | String | - | Terminal perintah untuk konfigurasi MQTT, waktu pengukuran, dan antrean offline. |
 | V11 | Measurement Quality | Integer | 0/1/2 | Kualitas hasil A02YYUW: 0 INVALID, 1 POOR, atau 2 GOOD. |
 | V12 | Samples Acquired | Integer | count | Jumlah seluruh sampel A02YYUW valid yang terkumpul selama duration. Gunakan rentang hingga 4095. |
 | V13 | Samples Used | Integer | count | Jumlah sampel yang dipakai dalam trimmed mean setelah filter MAD dan trimming. |
@@ -188,7 +188,10 @@ lakukan konfigurasi ulang melalui aplikasi Blynk seperti saat pemasangan
 pertama. Konfigurasi lama tetap tersimpan sampai pengganti dikirim melalui
 portal. Fallback ini hanya dipicu ketika ESP32 tidak tersambung ke Wi-Fi. Jika
 Wi-Fi tersambung tetapi internet atau Blynk Cloud sedang offline, konfigurasi
-Wi-Fi tidak dihapus.
+Wi-Fi tidak dihapus. Selama portal fallback aktif, firmware tetap menjalankan
+siklus pengukuran pada interval yang dikonfigurasi dan menyimpan setiap record
+ke antrean offline LittleFS. Portal tetap dapat digunakan oleh teknisi pada saat
+yang sama.
 
 Saat V17 bernilai `0`, dua wake pertama yang gagal tersambung ke Wi-Fi tetap
 memakai perilaku hemat daya: perangkat menyimpan record yang belum terkirim,
@@ -197,8 +200,13 @@ secara berturut-turut, perangkat membuka access point provisioning Blynk dan
 tetap terjaga agar dapat dikonfigurasi di lokasi baru. Counter disimpan di NVS
 agar tidak hilang selama deep sleep. Setiap koneksi Wi-Fi yang berhasil me-reset
 counter, meskipun internet atau Blynk Cloud sedang offline. Konfigurasi lama
-tidak dihapus ketika AP otomatis dibuka; setelah konfigurasi baru berhasil dan
-V17 tetap `0`, perangkat kembali ke jadwal ukur/deep sleep normal.
+tidak dihapus ketika AP otomatis dibuka. Setiap 30 detik firmware memindai SSID
+lama tanpa mematikan access point; ketika SSID itu muncul kembali, firmware
+mencoba password tersimpan selama maksimal 15 detik. Koneksi yang berhasil
+menutup fallback tanpa input portal, me-reset counter, lalu melanjutkan koneksi
+Blynk/MQTT dan replay antrean. Kegagalan percobaan tetap berada di portal dan
+tidak berpindah-pindah ke state koneksi Edgent. Setelah konfigurasi baru berhasil
+atau jaringan lama pulih, perangkat kembali ke jadwal ukur/deep sleep normal.
 
 Provisioning pertama dan reset manual dengan tombol BOOT tetap menahan perangkat
 dalam portal sampai konfigurasi selesai. Kegagalan internet saja tidak dihitung
@@ -218,6 +226,8 @@ Gunakan perintah berikut:
 ```text
 help
 mqtt show
+mqtt on
+mqtt off
 mqtt set 192.168.1.50
 mqtt apply
 mqtt reset
@@ -225,6 +235,8 @@ measure show
 measure interval 600
 measure duration 60
 measure reset
+offline show
+offline clear
 ```
 
 `mqtt set` hanya menerima satu alamat IPv4 unicast dan menyimpannya ke NVS;
@@ -235,12 +247,24 @@ dipakai. `mqtt reset` menghapus override dan mengembalikan `MQTT_HOST` dari
 Terminal ketika perangkat sedang online; untuk konfigurasi lebih nyaman,
 aktifkan V17 **Stay Awake** sementara lalu kembalikan ke `0` setelah selesai.
 
+`mqtt on` mengaktifkan delivery **Blynk + MQTT**, sedangkan `mqtt off`
+mengaktifkan **Blynk only**. Pilihan berlaku langsung, disimpan di NVS, dan
+dipertahankan setelah restart/deep sleep. Saat MQTT dimatikan, koneksi MQTT
+diputus dan antrean direkonsiliasi terhadap ACK Blynk; record yang sudah mendapat
+ACK Blynk tidak lagi ditahan hanya karena belum mendapat PUBACK MQTT. `mqtt show`
+menampilkan mode aktif bersama alamat broker.
+
 `measure interval <seconds>` mengatur jarak antar-siklus pengukuran dari `60`
 sampai `86400` detik. `measure duration <seconds>` mengatur jendela maksimum
 pengumpulan A02YYUW dari `5` sampai `120` detik. Interval harus selalu minimal
 30 detik lebih panjang daripada duration agar ada waktu untuk pengukuran lain,
 koneksi, dan upload. Nilai disimpan ke NVS dan berlaku untuk siklus berikutnya;
 `measure reset` mengembalikan interval `600` detik dan duration `60` detik.
+
+`offline show` menampilkan jumlah record yang menunggu dan counter record yang
+pernah dibuang. `offline clear` menghapus seluruh record yang saat itu tersimpan
+di antrean LittleFS. Sequence tetap monoton setelah penghapusan agar ACK lama
+yang terlambat tidak dapat menghapus record baru.
 
 Duration menentukan lamanya jendela pengumpulan setelah warm-up. Firmware
 membuang lima frame awal, lalu menyimpan semua frame valid sampai duration
@@ -585,6 +609,8 @@ queue LittleFS yang redundant. Kedua tujuan dapat terus maju secara independen,
 tetapi record baru dihapus setelah kedua cursor melewati sequence tersebut. Jika
 perangkat reset atau deep sleep setelah satu ACK, tujuan yang sudah selesai
 melanjutkan dari cursor-nya dan tujuan yang tertinggal tetap mengejar backlog.
+Nilai ini menjadi default build; perintah Terminal `mqtt on`/`mqtt off` dapat
+menggantinya dengan mode `BOTH`/`BLYNK_ONLY` yang persisten saat runtime.
 
 Dual delivery tidak memakai dua filesystem dan tidak menggandakan record.
 Queue tetap berisi maksimum 8.064 record x 66 byte, dua header queue 32 byte,

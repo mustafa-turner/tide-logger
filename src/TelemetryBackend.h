@@ -15,22 +15,22 @@ enum class TelemetryBackend { BLYNK_ONLY, MQTT_ONLY, BOTH };
 constexpr TelemetryBackend TELEMETRY_BACKEND_MODE =
     TIDE_BACKEND_ENUM(TELEMETRY_BACKEND);
 
-constexpr bool telemetryUsesBlynk() {
-  return TELEMETRY_BACKEND_MODE == TelemetryBackend::BLYNK_ONLY ||
-         TELEMETRY_BACKEND_MODE == TelemetryBackend::BOTH;
+constexpr bool telemetryBackendUsesBlynk(TelemetryBackend backend) {
+  return backend == TelemetryBackend::BLYNK_ONLY ||
+         backend == TelemetryBackend::BOTH;
 }
 
-constexpr bool telemetryUsesMqtt() {
-  return TELEMETRY_BACKEND_MODE == TelemetryBackend::MQTT_ONLY ||
-         TELEMETRY_BACKEND_MODE == TelemetryBackend::BOTH;
+constexpr bool telemetryBackendUsesMqtt(TelemetryBackend backend) {
+  return backend == TelemetryBackend::MQTT_ONLY ||
+         backend == TelemetryBackend::BOTH;
 }
 
-constexpr uint16_t telemetryRequiredDeliveryMask() {
-  return (telemetryUsesBlynk()
+constexpr uint16_t telemetryBackendDeliveryMask(TelemetryBackend backend) {
+  return (telemetryBackendUsesBlynk(backend)
               ? tide::telemetryDestinationBit(
                     tide::TelemetryDestination::BLYNK)
               : 0U) |
-         (telemetryUsesMqtt()
+         (telemetryBackendUsesMqtt(backend)
               ? tide::telemetryDestinationBit(
                     tide::TelemetryDestination::MQTT)
               : 0U);

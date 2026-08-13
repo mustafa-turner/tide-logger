@@ -126,6 +126,19 @@ bool MqttTelemetry::connected() const { return client_.connected(); }
 
 bool MqttTelemetry::disconnected() const { return client_.disconnected(); }
 
+void MqttTelemetry::disable() {
+  if (!initialized_) return;
+  wifiConnected_ = false;
+  if (!client_.disconnected()) client_.disconnect(true);
+  portENTER_CRITICAL(&deliveryMux_);
+  delivery_.clear();
+  earlyPubackPacketId_ = 0;
+  portEXIT_CRITICAL(&deliveryMux_);
+  nextConnectAttemptAt_ = 0;
+  reconnectBackoffMs_ = INITIAL_RECONNECT_BACKOFF_MS;
+  Serial.println("MQTT disabled; Blynk-only delivery is active.");
+}
+
 void MqttTelemetry::disconnectForSleep() {
   if (!initialized_ || client_.disconnected()) return;
   const bool force = awaitingPuback();

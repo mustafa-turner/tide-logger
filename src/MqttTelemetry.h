@@ -18,6 +18,7 @@ class MqttTelemetry {
   bool awaitingPuback() const;
   bool connected() const;
   bool disconnected() const;
+  void disable();
   void disconnectForSleep();
 
   const char *deviceId() const { return deviceId_; }

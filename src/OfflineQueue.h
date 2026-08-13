@@ -20,6 +20,7 @@ class OfflineQueue {
       uint32_t expectedSequence, TelemetryDestination destination,
       uint16_t requiredMask);
   bool reconcileDeliveries(uint16_t requiredMask, uint32_t &removedRecords);
+  bool clear();
   bool discardCorruptHead();
   bool updateNewestTimestamp(uint32_t expectedSequence,
                              uint64_t timestampMs);
