@@ -6,7 +6,7 @@
 #include "TelemetryPayload.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.6.0"
+#define BLYNK_FIRMWARE_VERSION "1.6.1"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -81,6 +81,7 @@ namespace
   constexpr uint32_t UPLOAD_ACK_TIMEOUT_MS = 1500;
   constexpr uint32_t MQTT_UPLOAD_DEADLINE_MS = 15000;
   constexpr uint32_t MQTT_DISCONNECT_GRACE_MS = 100;
+  constexpr uint32_t STAY_AWAKE_REPLAY_GAP_MS = 1000;
   constexpr uint8_t MAX_RECORD_UPLOADS_PER_CYCLE = 2;
   constexpr time_t MIN_VALID_UTC_EPOCH = 1704067200; // 2024-01-01 00:00 UTC
   constexpr char NTP_SERVER_PRIMARY[] = "pool.ntp.org";
@@ -1041,6 +1042,14 @@ namespace
 
   uint8_t recordUploadLimitForCurrentCycle()
   {
+    // Stay Awake drains the backlog as a sequence of one-record passes. Each
+    // pass still waits for every required destination ACK before another
+    // record is started.
+    if (deepSleepDisabled)
+    {
+      return 1;
+    }
+
     // Dua record hanya pada setiap dua slot UTC. Rata-rata 1,5 record/siklus
     // memberi ruang terhadap batas datapoint harian sambil menguras backlog.
     return cycleAbsoluteSlotValid && (cycleAbsoluteSlot % 2ULL) == 0
@@ -1064,6 +1073,32 @@ namespace
                                                  ? offlineQueue.count()
                                                  : 0),
                   static_cast<unsigned long>(OTA_LISTEN_WINDOW_MS));
+  }
+
+  void beginStayAwakeQueueDrainPass()
+  {
+    if (!deepSleepDisabled || !automaticMeasurementComplete ||
+        !otherMeasurementsComplete || !cycleUploaded ||
+        !offlineQueue.ready() || offlineQueue.count() == 0 ||
+        millis() - cycleUploadedAt < STAY_AWAKE_REPLAY_GAP_MS)
+    {
+      return;
+    }
+
+    cycleUploaded = false;
+    recordsUploadedThisCycle = 0;
+    blynkRecordsAcknowledgedThisCycle = 0;
+    mqttRecordsAcknowledgedThisCycle = 0;
+    blynkUploadFinishedForCycle = !telemetryUsesBlynk();
+    mqttUploadFinishedForCycle = !telemetryUsesMqtt();
+    pendingUploadSequence = 0;
+    pendingUploadAcknowledged = false;
+    offlineUploadState = OfflineUploadState::IDLE;
+    mqttUploadDeadlineArmed = false;
+    mqttUploadDeadlineStartedAt = 0;
+    Serial.printf("Stay Awake: starting one-record offline replay pass; "
+                  "queued=%lu.\n",
+                  static_cast<unsigned long>(offlineQueue.count()));
   }
 
   void finishDestinationUploadForCycle(
@@ -2241,10 +2276,12 @@ namespace
     }
   }
 
-  void serviceProvisioningMeasurements()
+  void serviceContinuousMeasurements()
   {
-    if (!fallbackProvisioningActive || !normalCycleStarted ||
-        !provisioningStateAllowsMeasurements())
+    if ((!fallbackProvisioningActive && !deepSleepDisabled) ||
+        !normalCycleStarted || BlynkState::is(MODE_OTA_UPGRADE) ||
+        (fallbackProvisioningActive &&
+         !provisioningStateAllowsMeasurements()))
     {
       return;
     }
@@ -2675,7 +2712,7 @@ void setup()
   edgentTimer.setInterval(WIFI_FALLBACK_SERVICE_INTERVAL_MS,
                           serviceSavedWifiRecovery);
   edgentTimer.setInterval(PROVISIONING_MEASUREMENT_SERVICE_INTERVAL_MS,
-                          serviceProvisioningMeasurements);
+                          serviceContinuousMeasurements);
   edgentConfiguredAtBoot = edgentIsConfigured();
   provisioningRequested = !edgentConfiguredAtBoot;
   registerA02YYUWConsoleCommand();
@@ -2785,10 +2822,26 @@ void loop()
     performOtherCycleMeasurements();
   }
 
+  // A due measurement always wins over background replay. No record publish
+  // or ACK processing is started while the A02YYUW collection window is live.
+  if ((deepSleepDisabled || fallbackProvisioningActive) &&
+      otherMeasurementsComplete && stayAwakeCycleIsDue())
+  {
+    Serial.printf("%s: memulai slot %lu detik berikutnya.\n",
+                  fallbackProvisioningActive ? "Provisioning aktif"
+                                             : "V17 Stay Awake aktif",
+                  static_cast<unsigned long>(measurementIntervalSeconds));
+    startNormalMeasurementCycle();
+    return;
+  }
+
   // MQTT depends only on the already-provisioned Wi-Fi link. It is serviced
   // before Blynk cloud state/error handling so a local broker can acknowledge
   // records even while Blynk Cloud is unavailable.
-  serviceMqttOfflineUpload();
+  if (automaticMeasurementComplete && otherMeasurementsComplete)
+  {
+    serviceMqttOfflineUpload();
+  }
 
   if (!automaticMeasurementComplete)
   {
@@ -2875,24 +2928,11 @@ void loop()
     return;
   }
 
-  // Tanpa deep sleep, mulai siklus baru pada interval yang dikonfigurasi tanpa
-  // me-restart ESP32. Jalur provisioning di atas tetap memiliki prioritas.
-  if ((deepSleepDisabled || fallbackProvisioningActive) &&
-      otherMeasurementsComplete &&
-      stayAwakeCycleIsDue())
-  {
-    Serial.printf("%s: memulai slot %lu detik berikutnya.\n",
-                  fallbackProvisioningActive ? "Provisioning aktif"
-                                             : "V17 Stay Awake aktif",
-                  static_cast<unsigned long>(measurementIntervalSeconds));
-    startNormalMeasurementCycle();
-    return;
-  }
-
   if (cycleUploaded)
   {
     if (deepSleepDisabled)
     {
+      beginStayAwakeQueueDrainPass();
       BlynkEdgent.run();
     }
     else if (!Blynk.connected() ||

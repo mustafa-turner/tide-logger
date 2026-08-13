@@ -193,6 +193,14 @@ siklus pengukuran pada interval yang dikonfigurasi dan menyimpan setiap record
 ke antrean offline LittleFS. Portal tetap dapat digunakan oleh teknisi pada saat
 yang sama.
 
+Ketika V17 **Stay Awake** aktif dan koneksi tersedia, firmware menguras antrean
+offline terus-menerus satu record per pass tanpa menunggu slot pengukuran
+berikutnya. Setiap record tetap menunggu ACK Blynk dan/atau PUBACK MQTT sesuai
+mode delivery sebelum record berikutnya dimulai, dengan jeda satu detik antar
+pass. Saat slot ukur tiba, replay diprioritaskan lebih rendah: firmware memulai
+jendela A02YYUW, menyelesaikan INA3221/SHT40, dan menyimpan record lebih dahulu;
+tidak ada publish record offline selama akuisisi berlangsung.
+
 Saat V17 bernilai `0`, dua wake pertama yang gagal tersambung ke Wi-Fi tetap
 memakai perilaku hemat daya: perangkat menyimpan record yang belum terkirim,
 deep sleep, lalu mencoba lagi pada wake berikutnya. Pada kegagalan Wi-Fi ketiga
@@ -396,7 +404,9 @@ Untuk memberi ruang terhadap batas datapoint harian Blynk, firmware mengirim sat
 record pada satu slot dan maksimal dua record pada slot UTC berikutnya. Rata-rata
 maksimum adalah 1,5 record per siklus, sehingga backlog berkurang bertahap ketika
 koneksi pulih. Ketika kapasitas penuh, record tertua dibuang dan penghitung V20
-bertambah.
+bertambah. Batas per-siklus ini berlaku pada operasi deep sleep normal; V17
+**Stay Awake** memakai replay satu-record berkelanjutan seperti dijelaskan di
+atas.
 
 Record yang dibuat setelah UTC tersedia mempertahankan timestamp asli. Record
 yang dibuat setelah cold boot tanpa NTP tetap disimpan, tetapi ketika diunggah
@@ -706,8 +716,11 @@ record baru dihapus setelah packet ID PUBACK yang sama diterima.
 
 Per siklus, firmware mencoba koneksi/upload MQTT selama maksimum 15 detik dan
 memakai reconnect backoff tanpa busy-loop. Maksimum replay tetap satu atau dua
-record (sesuai slot UTC), oldest-first. Deep sleep ditahan selama menunggu
-PUBACK, lalu dilanjutkan setelah ACK atau deadline; pada timeout record tetap di
+record (sesuai slot UTC), oldest-first, ketika deep sleep aktif. Pada mode V17
+**Stay Awake**, setiap pass tetap oldest-first dan maksimal satu record, tetapi
+pass berikutnya dimulai setelah ACK dan jeda satu detik sampai antrean kosong
+atau slot pengukuran berikutnya tiba. Deep sleep ditahan selama menunggu PUBACK,
+lalu dilanjutkan setelah ACK atau deadline; pada timeout record tetap di
 LittleFS. MQTT diputus sebelum Wi-Fi dimatikan.
 
 Contoh log normal (tanpa password/token):
