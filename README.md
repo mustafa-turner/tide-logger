@@ -182,7 +182,7 @@ nilai `1` menonaktifkan deep sleep. Pilihan ini disimpan ke NVS dan disinkronkan
 dari Blynk ketika perangkat tersambung kembali.
 
 Saat V17 **Stay Awake** bernilai `1`, kegagalan menyambung ke Wi-Fi secara terus
-menerus selama dua menit akan membuka access point provisioning Blynk.
+menerus selama minimal empat jam akan membuka access point provisioning Blynk.
 Sambungkan ponsel ke access point bernama `Blynk <nama-template>-XXXX`, lalu
 lakukan konfigurasi ulang melalui aplikasi Blynk seperti saat pemasangan
 pertama. Konfigurasi lama tetap tersimpan sampai pengganti dikirim melalui
@@ -201,20 +201,27 @@ pass. Saat slot ukur tiba, replay diprioritaskan lebih rendah: firmware memulai
 jendela A02YYUW, menyelesaikan INA3221/SHT40, dan menyimpan record lebih dahulu;
 tidak ada publish record offline selama akuisisi berlangsung.
 
-Saat V17 bernilai `0`, dua wake pertama yang gagal tersambung ke Wi-Fi tetap
-memakai perilaku hemat daya: perangkat menyimpan record yang belum terkirim,
-deep sleep, lalu mencoba lagi pada wake berikutnya. Pada kegagalan Wi-Fi ketiga
-secara berturut-turut, perangkat membuka access point provisioning Blynk dan
-tetap terjaga agar dapat dikonfigurasi di lokasi baru. Counter disimpan di NVS
-agar tidak hilang selama deep sleep. Setiap koneksi Wi-Fi yang berhasil me-reset
-counter, meskipun internet atau Blynk Cloud sedang offline. Konfigurasi lama
-tidak dihapus ketika AP otomatis dibuka. Setiap 30 detik firmware memindai SSID
-lama tanpa mematikan access point; ketika SSID itu muncul kembali, firmware
-mencoba password tersimpan selama maksimal 15 detik. Koneksi yang berhasil
-menutup fallback tanpa input portal, me-reset counter, lalu melanjutkan koneksi
-Blynk/MQTT dan replay antrean. Kegagalan percobaan tetap berada di portal dan
-tidak berpindah-pindah ke state koneksi Edgent. Setelah konfigurasi baru berhasil
-atau jaringan lama pulih, perangkat kembali ke jadwal ukur/deep sleep normal.
+Saat V17 bernilai `0`, setiap wake yang gagal tersambung ke Wi-Fi tetap memakai
+perilaku hemat daya: perangkat menyimpan record yang belum terkirim, deep sleep,
+lalu mencoba lagi pada wake berikutnya. Access point provisioning baru dibuka
+setelah outage Wi-Fi tercatat selama minimal empat jam. Status timer outage,
+waktu mulai, durasi aktif, dan deep sleep yang selesai disimpan di NVS agar
+perhitungan berlanjut antar-wake tanpa dapat maju terlalu cepat akibat reset atau
+wake lebih awal. V17 `0` dan V17 `1` memakai timer outage empat jam yang sama.
+Setiap koneksi Wi-Fi yang berhasil me-reset timer, meskipun internet atau Blynk
+Cloud sedang offline. Konfigurasi lama
+tidak dihapus ketika AP otomatis dibuka. Setiap 30 detik firmware langsung
+mencoba kredensial lama dalam mode AP+STA selama maksimal 15 detik; percobaan
+ini tidak bergantung pada hasil pemindaian SSID sehingga juga bekerja untuk SSID
+tersembunyi dan tidak dapat macet pada state pemindaian. Access point dan portal
+tetap dilayani selama percobaan. Koneksi yang berhasil menutup fallback tanpa
+input portal, me-reset timer outage, lalu melanjutkan koneksi Blynk/MQTT dan replay
+antrean. Kegagalan percobaan tetap berada di portal dan tidak berpindah-pindah
+ke state koneksi Edgent. Status recovery serta salinan konfigurasi terakhir yang
+sudah berhasil terhubung disimpan di NVS, sehingga recovery diteruskan setelah
+reset atau kehilangan daya tanpa menghapus kredensial lama. Setelah konfigurasi
+baru berhasil atau jaringan lama pulih, perangkat kembali ke jadwal ukur/deep
+sleep normal.
 
 Provisioning pertama dan reset manual dengan tombol BOOT tetap menahan perangkat
 dalam portal sampai konfigurasi selesai. Kegagalan internet saja tidak dihitung

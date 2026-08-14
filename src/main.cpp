@@ -67,11 +67,12 @@ namespace
   static_assert(A02YYUW_SAMPLE_CAPACITY <= 0x0FFF,
                 "Packed offline sample counters support at most 4095");
   constexpr uint32_t EDGENT_CONNECT_TIMEOUT_MS = 15000;
-  constexpr uint32_t STAY_AWAKE_WIFI_REPROVISION_MS = 2UL * 60UL * 1000UL;
+  constexpr uint32_t WIFI_OUTAGE_BEFORE_PROVISIONING_SECONDS =
+      4UL * 60UL * 60UL;
+  constexpr uint32_t WIFI_OUTAGE_PROGRESS_INTERVAL_MS = 30UL * 60UL * 1000UL;
   constexpr uint32_t WIFI_FALLBACK_SERVICE_INTERVAL_MS = 1000;
   constexpr uint32_t PROVISIONING_MEASUREMENT_SERVICE_INTERVAL_MS = 10;
-  constexpr uint32_t SAVED_WIFI_SCAN_INTERVAL_MS = 30UL * 1000UL;
-  constexpr uint32_t SAVED_WIFI_SCAN_TIMEOUT_MS = 20UL * 1000UL;
+  constexpr uint32_t SAVED_WIFI_RETRY_INTERVAL_MS = 30UL * 1000UL;
   constexpr uint32_t SAVED_WIFI_CONNECT_TIMEOUT_MS = 15UL * 1000UL;
   constexpr uint32_t BLYNK_SYNC_FALLBACK_MS = 3000;
   constexpr uint32_t OTA_LISTEN_WINDOW_MS = 15000;
@@ -88,8 +89,12 @@ namespace
   constexpr char NTP_SERVER_SECONDARY[] = "time.google.com";
   constexpr char NTP_SERVER_TERTIARY[] = "time.cloudflare.com";
   constexpr char STAY_AWAKE_KEY[] = "stay_awake";
-  constexpr char WIFI_FAILURE_COUNT_KEY[] = "wifi_fail";
-  constexpr uint8_t WIFI_FAILURES_BEFORE_PROVISIONING = 3;
+  constexpr char WIFI_OUTAGE_ACTIVE_KEY[] = "wifi_out_on";
+  constexpr char WIFI_OUTAGE_STARTED_KEY[] = "wifi_out_at";
+  constexpr char WIFI_OUTAGE_ELAPSED_KEY[] = "wifi_out_s";
+  constexpr char WIFI_OUTAGE_SLEEP_KEY[] = "wifi_sleep_s";
+  constexpr char WIFI_RECOVERY_ACTIVE_KEY[] = "wifi_recover";
+  constexpr char LAST_GOOD_CONFIG_KEY[] = "wifi_good";
   constexpr char MEASUREMENT_INTERVAL_KEY[] = "measure_s";
   constexpr char COLLECTION_WINDOW_KEY[] = "collect_s";
   constexpr char MQTT_HOST_KEY[] = "mqtt_host";
@@ -175,19 +180,22 @@ namespace
   bool edgentConnectTimedOut = false;
   bool provisioningRequested = false;
   bool fallbackProvisioningActive = false;
+  bool wifiRecoveryPersisted = false;
   bool fallbackSavedConfigAvailable = false;
   ConfigStore fallbackSavedConfig = {};
-  bool stayAwakeWifiFailureTracked = false;
-  uint8_t consecutiveWifiFailedWakeCycles = 0;
+  bool wifiOutageActive = false;
+  uint64_t wifiOutageStartedEpoch = 0;
+  uint32_t wifiOutageElapsedSeconds = 0;
   bool cycleUploaded = false;
   bool v6SyncReceived = false;
   bool v17SyncReceived = false;
   bool deepSleepDisabled = false;
   uint32_t edgentConnectStartedAt = 0;
-  uint32_t stayAwakeWifiFailureStartedAt = 0;
-  uint32_t lastSavedWifiScanAt = 0;
-  uint32_t savedWifiScanStartedAt = 0;
+  uint32_t wifiOutageAwakeStartedAt = 0;
+  uint32_t lastWifiOutageProgressAt = 0;
+  uint32_t lastSavedWifiAttemptAt = 0;
   uint32_t savedWifiConnectStartedAt = 0;
+  uint32_t savedWifiReconnectAttempts = 0;
   uint32_t blynkConnectedAt = 0;
   uint32_t cycleUploadedAt = 0;
   bool ntpSyncRequested = false;
@@ -222,7 +230,6 @@ namespace
   enum class SavedWifiRecoveryState : uint8_t
   {
     IDLE,
-    SCANNING,
     CONNECTING,
   };
 
@@ -2006,57 +2013,213 @@ namespace
     return configStore.getFlag(CONFIG_FLAG_VALID);
   }
 
-  void clearStayAwakeWifiFailureTracking()
+  bool configContainsUsableCredentials(const ConfigStore &candidate)
   {
-    stayAwakeWifiFailureTracked = false;
-    stayAwakeWifiFailureStartedAt = 0;
+    return candidate.magic == configDefault.magic &&
+           (candidate.flags & CONFIG_FLAG_VALID) != 0 &&
+           candidate.wifiSSID[0] != '\0' && candidate.cloudToken[0] != '\0';
   }
 
-  void resetConsecutiveWifiFailures()
+  void persistAutomaticWifiRecovery(bool active)
   {
-    if (consecutiveWifiFailedWakeCycles == 0)
+    if (wifiRecoveryPersisted == active)
+    {
+      return;
+    }
+    if (appPreferences.putBool(WIFI_RECOVERY_ACTIVE_KEY, active) != sizeof(bool))
+    {
+      Serial.println("WARNING: automatic Wi-Fi recovery state could not be "
+                     "saved to NVS.");
+      return;
+    }
+    wifiRecoveryPersisted = active;
+  }
+
+  bool loadLastKnownGoodConfig(ConfigStore &saved);
+
+  bool saveLastKnownGoodConfig(const ConfigStore &source,
+                               bool replaceExisting = true)
+  {
+    ConfigStore saved = source;
+    saved.setFlag(CONFIG_FLAG_VALID, true);
+    if (!configContainsUsableCredentials(saved))
+    {
+      return false;
+    }
+
+    ConfigStore existing = {};
+    if (loadLastKnownGoodConfig(existing) &&
+        memcmp(&existing, &saved, sizeof(saved)) == 0)
+    {
+      return true;
+    }
+    if (configContainsUsableCredentials(existing) && !replaceExisting)
+    {
+      return true;
+    }
+
+    const size_t bytesWritten =
+        appPreferences.putBytes(LAST_GOOD_CONFIG_KEY, &saved, sizeof(saved));
+    if (bytesWritten != sizeof(saved))
+    {
+      Serial.println("WARNING: last-known-good Edgent configuration could not "
+                     "be backed up to NVS.");
+      return false;
+    }
+    return true;
+  }
+
+  bool loadLastKnownGoodConfig(ConfigStore &saved)
+  {
+    if (appPreferences.getBytesLength(LAST_GOOD_CONFIG_KEY) != sizeof(saved) ||
+        appPreferences.getBytes(LAST_GOOD_CONFIG_KEY, &saved, sizeof(saved)) !=
+            sizeof(saved))
+    {
+      return false;
+    }
+    return configContainsUsableCredentials(saved);
+  }
+
+  void clearLastKnownGoodConfig()
+  {
+    appPreferences.remove(LAST_GOOD_CONFIG_KEY);
+  }
+
+  void resetWifiOutageTracking()
+  {
+    if (!wifiOutageActive)
     {
       return;
     }
 
-    consecutiveWifiFailedWakeCycles = 0;
-    if (appPreferences.putUChar(WIFI_FAILURE_COUNT_KEY, 0) != sizeof(uint8_t))
+    wifiOutageActive = false;
+    wifiOutageStartedEpoch = 0;
+    wifiOutageElapsedSeconds = 0;
+    wifiOutageAwakeStartedAt = millis();
+    lastWifiOutageProgressAt = 0;
+    appPreferences.remove(WIFI_OUTAGE_ACTIVE_KEY);
+    appPreferences.remove(WIFI_OUTAGE_STARTED_KEY);
+    appPreferences.remove(WIFI_OUTAGE_ELAPSED_KEY);
+    appPreferences.remove(WIFI_OUTAGE_SLEEP_KEY);
+    Serial.println("Wi-Fi connected; four-hour outage timer reset.");
+  }
+
+  void beginWifiOutageTracking()
+  {
+    if (wifiOutageActive)
     {
-      Serial.println("PERINGATAN: counter kegagalan Wi-Fi gagal di-reset.");
+      return;
     }
-    else
+
+    wifiOutageActive = true;
+    wifiOutageElapsedSeconds = 0;
+    wifiOutageAwakeStartedAt = millis();
+    lastWifiOutageProgressAt = millis();
+
+    timeval utcNow = {};
+    wifiOutageStartedEpoch = getValidUtcTime(utcNow)
+                                 ? static_cast<uint64_t>(utcNow.tv_sec)
+                                 : 0;
+    bool saved =
+        appPreferences.putBool(WIFI_OUTAGE_ACTIVE_KEY, true) == sizeof(bool);
+    saved = appPreferences.putULong64(WIFI_OUTAGE_STARTED_KEY,
+                                      wifiOutageStartedEpoch) ==
+                sizeof(uint64_t) &&
+            saved;
+    saved = appPreferences.putUInt(WIFI_OUTAGE_ELAPSED_KEY, 0) ==
+                sizeof(uint32_t) &&
+            saved;
+    appPreferences.remove(WIFI_OUTAGE_SLEEP_KEY);
+    if (!saved)
     {
-      Serial.println("Wi-Fi tersambung; counter kegagalan wake di-reset.");
+      Serial.println("WARNING: Wi-Fi outage timer could not be fully saved to "
+                     "NVS.");
+    }
+
+    Serial.printf("Wi-Fi outage detected; automatic provisioning will remain "
+                  "disabled until the outage has lasted at least %lu hours.\n",
+                  static_cast<unsigned long>(
+                      WIFI_OUTAGE_BEFORE_PROVISIONING_SECONDS / 3600UL));
+  }
+
+  void checkpointWifiOutageAwakeTime()
+  {
+    if (!wifiOutageActive)
+    {
+      return;
+    }
+
+    const uint32_t awakeSeconds =
+        (millis() - wifiOutageAwakeStartedAt) / 1000UL;
+    if (awakeSeconds == 0)
+    {
+      return;
+    }
+
+    const uint64_t updated =
+        static_cast<uint64_t>(wifiOutageElapsedSeconds) + awakeSeconds;
+    wifiOutageElapsedSeconds =
+        updated > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(updated);
+    wifiOutageAwakeStartedAt = millis();
+    if (appPreferences.putUInt(WIFI_OUTAGE_ELAPSED_KEY,
+                               wifiOutageElapsedSeconds) != sizeof(uint32_t))
+    {
+      Serial.println("WARNING: Wi-Fi outage duration checkpoint failed.");
     }
   }
 
-  bool recordFailedWifiWakeCycle()
+  uint32_t currentWifiOutageDurationSeconds()
   {
-    if (consecutiveWifiFailedWakeCycles <
-        WIFI_FAILURES_BEFORE_PROVISIONING)
+    if (!wifiOutageActive)
     {
-      ++consecutiveWifiFailedWakeCycles;
+      return 0;
     }
 
-    if (appPreferences.putUChar(WIFI_FAILURE_COUNT_KEY,
-                                consecutiveWifiFailedWakeCycles) !=
-        sizeof(uint8_t))
+    timeval utcNow = {};
+    if (wifiOutageStartedEpoch != 0 && getValidUtcTime(utcNow) &&
+        static_cast<uint64_t>(utcNow.tv_sec) >= wifiOutageStartedEpoch)
     {
-      Serial.println("PERINGATAN: counter kegagalan Wi-Fi gagal disimpan.");
+      const uint64_t elapsed =
+          static_cast<uint64_t>(utcNow.tv_sec) - wifiOutageStartedEpoch;
+      return elapsed > UINT32_MAX ? UINT32_MAX
+                                  : static_cast<uint32_t>(elapsed);
     }
 
-    Serial.printf("Wake tanpa Wi-Fi: %u/%u kegagalan berturut-turut.\n",
-                  consecutiveWifiFailedWakeCycles,
-                  WIFI_FAILURES_BEFORE_PROVISIONING);
-    return consecutiveWifiFailedWakeCycles >=
-           WIFI_FAILURES_BEFORE_PROVISIONING;
+    const uint64_t elapsed = static_cast<uint64_t>(wifiOutageElapsedSeconds) +
+                             (millis() - wifiOutageAwakeStartedAt) / 1000UL;
+    return elapsed > UINT32_MAX ? UINT32_MAX
+                                : static_cast<uint32_t>(elapsed);
+  }
+
+  bool wifiOutageProvisioningThresholdReached(bool forceProgressLog)
+  {
+    beginWifiOutageTracking();
+    const uint32_t elapsed = currentWifiOutageDurationSeconds();
+    const bool progressDue =
+        forceProgressLog ||
+        millis() - lastWifiOutageProgressAt >=
+            WIFI_OUTAGE_PROGRESS_INTERVAL_MS;
+    if (progressDue)
+    {
+      checkpointWifiOutageAwakeTime();
+      lastWifiOutageProgressAt = millis();
+      const uint32_t remaining =
+          elapsed >= WIFI_OUTAGE_BEFORE_PROVISIONING_SECONDS
+              ? 0
+              : WIFI_OUTAGE_BEFORE_PROVISIONING_SECONDS - elapsed;
+      Serial.printf("Wi-Fi outage duration: %lu min; provisioning fallback in "
+                    "%lu min if Wi-Fi remains unavailable.\n",
+                    static_cast<unsigned long>(elapsed / 60UL),
+                    static_cast<unsigned long>((remaining + 59UL) / 60UL));
+    }
+    return elapsed >= WIFI_OUTAGE_BEFORE_PROVISIONING_SECONDS;
   }
 
   void serviceSuccessfulWifiConnection()
   {
     if (WiFi.status() == WL_CONNECTED)
     {
-      resetConsecutiveWifiFailures();
+      resetWifiOutageTracking();
     }
   }
 
@@ -2073,7 +2236,6 @@ namespace
   void resetSavedWifiRecovery()
   {
     savedWifiRecoveryState = SavedWifiRecoveryState::IDLE;
-    savedWifiScanStartedAt = 0;
     savedWifiConnectStartedAt = 0;
   }
 
@@ -2085,12 +2247,21 @@ namespace
 
   void restoreFallbackSavedConfig(const char *reason)
   {
-    if (!fallbackSavedConfigAvailable)
+    ConfigStore saved = {};
+    if (fallbackSavedConfigAvailable)
     {
+      saved = fallbackSavedConfig;
+    }
+    else if (!loadLastKnownGoodConfig(saved))
+    {
+      Serial.println("WARNING: no last-known-good Edgent configuration was "
+                     "available to restore.");
       return;
     }
 
-    configStore = fallbackSavedConfig;
+    configStore = saved;
+    fallbackSavedConfig = saved;
+    fallbackSavedConfigAvailable = true;
     if (!config_save())
     {
       Serial.println("WARNING: failed to restore the last-known Edgent "
@@ -2100,7 +2271,7 @@ namespace
                   "last-known credentials restored.\n",
                   reason);
     resetSavedWifiRecovery();
-    lastSavedWifiScanAt = millis() - SAVED_WIFI_SCAN_INTERVAL_MS;
+    lastSavedWifiAttemptAt = millis() - SAVED_WIFI_RETRY_INTERVAL_MS;
     BlynkState::set(MODE_WAIT_CONFIG);
   }
 
@@ -2110,14 +2281,18 @@ namespace
     {
       fallbackSavedConfig = configStore;
       fallbackSavedConfigAvailable = true;
+      // Seed installations upgraded from older firmware, but only a verified
+      // Blynk connection may replace an existing last-known-good backup.
+      saveLastKnownGoodConfig(configStore, false);
     }
+    persistAutomaticWifiRecovery(true);
     provisioningRequested = true;
     fallbackProvisioningActive = true;
     edgentConnectTimeoutArmed = false;
     edgentConnectTimedOut = false;
-    clearStayAwakeWifiFailureTracking();
     resetSavedWifiRecovery();
-    lastSavedWifiScanAt = millis() - SAVED_WIFI_SCAN_INTERVAL_MS;
+    lastSavedWifiAttemptAt = millis() - SAVED_WIFI_RETRY_INTERVAL_MS;
+    savedWifiReconnectAttempts = 0;
     Blynk.disconnect();
     WiFi.disconnect(false, false);
     Serial.printf("Provisioning fallback entered: %s Saved Wi-Fi credentials "
@@ -2153,13 +2328,11 @@ namespace
       return;
     }
 
-    // Let an attached technician finish interacting with the portal. Recovery
-    // resumes as soon as Edgent returns from MODE_CONFIGURING to WAIT_CONFIG.
-    if (BlynkState::is(MODE_CONFIGURING))
-    {
-      return;
-    }
-    if (!BlynkState::is(MODE_WAIT_CONFIG))
+    // MODE_CONFIGURING only means a client is attached to the AP; pausing here
+    // indefinitely would let a stale portal client suppress unattended
+    // recovery. AP+STA keeps the portal serviced during each bounded attempt.
+    if (!BlynkState::is(MODE_WAIT_CONFIG) &&
+        !BlynkState::is(MODE_CONFIGURING))
     {
       resetSavedWifiRecovery();
       return;
@@ -2167,63 +2340,13 @@ namespace
 
     if (savedWifiRecoveryState == SavedWifiRecoveryState::IDLE)
     {
-      if (millis() - lastSavedWifiScanAt < SAVED_WIFI_SCAN_INTERVAL_MS)
+      if (millis() - lastSavedWifiAttemptAt < SAVED_WIFI_RETRY_INTERVAL_MS)
       {
         return;
       }
 
-      lastSavedWifiScanAt = millis();
+      lastSavedWifiAttemptAt = millis();
       WiFi.mode(WIFI_AP_STA);
-      WiFi.scanDelete();
-      const int16_t scanStart = WiFi.scanNetworks(true, true);
-      if (scanStart == WIFI_SCAN_FAILED)
-      {
-        Serial.println("Saved Wi-Fi scan could not be started; will retry.");
-        return;
-      }
-      savedWifiScanStartedAt = millis();
-      savedWifiRecoveryState = SavedWifiRecoveryState::SCANNING;
-      return;
-    }
-
-    if (savedWifiRecoveryState == SavedWifiRecoveryState::SCANNING)
-    {
-      const int16_t networkCount = WiFi.scanComplete();
-      if (networkCount == WIFI_SCAN_RUNNING)
-      {
-        if (millis() - savedWifiScanStartedAt >= SAVED_WIFI_SCAN_TIMEOUT_MS)
-        {
-          WiFi.scanDelete();
-          Serial.println("Saved Wi-Fi scan timed out; will retry.");
-          resetSavedWifiRecovery();
-        }
-        return;
-      }
-      if (networkCount == WIFI_SCAN_FAILED)
-      {
-        Serial.println("Saved Wi-Fi scan failed; will retry.");
-        resetSavedWifiRecovery();
-        return;
-      }
-
-      bool savedSsidFound = false;
-      for (int16_t index = 0; index < networkCount; ++index)
-      {
-        if (WiFi.SSID(index) == configStore.wifiSSID)
-        {
-          savedSsidFound = true;
-          break;
-        }
-      }
-      WiFi.scanDelete();
-
-      if (!savedSsidFound)
-      {
-        resetSavedWifiRecovery();
-        return;
-      }
-
-      Serial.printf("Saved SSID detected again: %s.\n", configStore.wifiSSID);
       if (configStore.getFlag(CONFIG_FLAG_STATIC_IP) &&
           !WiFi.config(configStore.staticIP, configStore.staticGW,
                        configStore.staticMask, configStore.staticDNS,
@@ -2231,12 +2354,14 @@ namespace
       {
         Serial.println("Automatic reconnect failure: saved static IP "
                        "configuration could not be applied.");
-        resetSavedWifiRecovery();
+        lastSavedWifiAttemptAt = millis();
         return;
       }
 
-      Serial.printf("Automatic reconnect attempt using saved credentials for "
-                    "%s.\n",
+      ++savedWifiReconnectAttempts;
+      Serial.printf("Automatic reconnect attempt #%lu using saved credentials "
+                    "for SSID %s (provisioning AP remains active).\n",
+                    static_cast<unsigned long>(savedWifiReconnectAttempts),
                     configStore.wifiSSID);
       WiFi.begin(configStore.wifiSSID, configStore.wifiPass);
       savedWifiConnectStartedAt = millis();
@@ -2246,13 +2371,16 @@ namespace
 
     if (WiFi.status() == WL_CONNECTED)
     {
+      Serial.printf("Saved SSID detected again through successful association: "
+                    "%s.\n",
+                    configStore.wifiSSID);
       Serial.printf("Automatic reconnect success: %s connected.\n",
                     configStore.wifiSSID);
       provisioningRequested = false;
       fallbackProvisioningActive = false;
+      persistAutomaticWifiRecovery(false);
       discardFallbackSavedConfig();
-      clearStayAwakeWifiFailureTracking();
-      resetConsecutiveWifiFailures();
+      resetWifiOutageTracking();
       resetSavedWifiRecovery();
       WiFi.softAPdisconnect(false);
       WiFi.mode(WIFI_STA);
@@ -2265,14 +2393,18 @@ namespace
     if (millis() - savedWifiConnectStartedAt >=
         SAVED_WIFI_CONNECT_TIMEOUT_MS)
     {
+      const wl_status_t failedStatus = WiFi.status();
       WiFi.disconnect(false, false);
+      WiFi.mode(WIFI_AP_STA);
       Serial.printf("Automatic reconnect failure: %s did not connect within "
-                    "%lu seconds; provisioning AP remains active.\n",
+                    "%lu seconds (Wi-Fi status %d); provisioning AP remains "
+                    "active and saved credentials will be retried.\n",
                     configStore.wifiSSID,
                     static_cast<unsigned long>(
-                        SAVED_WIFI_CONNECT_TIMEOUT_MS / 1000UL));
+                        SAVED_WIFI_CONNECT_TIMEOUT_MS / 1000UL),
+                    static_cast<int>(failedStatus));
       resetSavedWifiRecovery();
-      lastSavedWifiScanAt = millis();
+      lastSavedWifiAttemptAt = millis();
     }
   }
 
@@ -2305,19 +2437,16 @@ namespace
     // cloud timeout can be mistaken for a Wi-Fi failure.
     serviceSuccessfulWifiConnection();
 
-    // Automatic re-provisioning is deliberately exclusive to Stay Awake.
-    // Normal wake cycles must keep their saved credentials, time out, queue
-    // telemetry, and sleep when either Wi-Fi or the internet is unavailable.
+    // Deep-sleep wake cycles check the same durable outage clock when their
+    // bounded connection window expires. This timer handles Stay Awake mode.
     if (!deepSleepDisabled || provisioningRequested || !edgentIsConfigured())
     {
-      clearStayAwakeWifiFailureTracking();
       return;
     }
 
     if (WiFi.status() == WL_CONNECTED)
     {
       // A Blynk Cloud/internet outage is not a Wi-Fi credential failure.
-      clearStayAwakeWifiFailureTracking();
       return;
     }
 
@@ -2327,25 +2456,13 @@ namespace
       return;
     }
 
-    if (!stayAwakeWifiFailureTracked)
-    {
-      stayAwakeWifiFailureTracked = true;
-      stayAwakeWifiFailureStartedAt = millis();
-      Serial.printf("Stay Awake: Wi-Fi belum tersambung; portal konfigurasi "
-                    "akan dibuka setelah %lu detik jika kegagalan berlanjut.\n",
-                    static_cast<unsigned long>(
-                        STAY_AWAKE_WIFI_REPROVISION_MS / 1000UL));
-      return;
-    }
-
-    if (millis() - stayAwakeWifiFailureStartedAt <
-        STAY_AWAKE_WIFI_REPROVISION_MS)
+    if (!wifiOutageProvisioningThresholdReached(false))
     {
       return;
     }
 
     enterProvisioningFallback(
-        "Stay Awake Wi-Fi remained unavailable; opening the Blynk AP.");
+        "Stay Awake Wi-Fi outage reached four hours; opening the Blynk AP.");
   }
 
   bool otaIsPendingOrRunning()
@@ -2370,19 +2487,20 @@ namespace
 
     edgentConnectTimeoutArmed = false;
 
-    if (WiFi.status() != WL_CONNECTED && recordFailedWifiWakeCycle())
+    if (WiFi.status() != WL_CONNECTED &&
+        wifiOutageProvisioningThresholdReached(true))
     {
       enterProvisioningFallback(
-          "three consecutive wake cycles failed to connect to Wi-Fi; "
+          "Wi-Fi remained unavailable for at least four hours; "
           "opening the Blynk AP and staying awake.");
       return;
     }
 
     // Reaching Wi-Fi but not Blynk Cloud is an internet/cloud failure, not a
-    // credential failure, so it breaks the consecutive Wi-Fi failure streak.
+    // credential failure, so it clears the Wi-Fi outage timer.
     if (WiFi.status() == WL_CONNECTED)
     {
-      resetConsecutiveWifiFailures();
+      resetWifiOutageTracking();
     }
 
     edgentConnectTimedOut = true;
@@ -2432,10 +2550,6 @@ namespace
       edgentConnectTimeoutArmed = false;
       edgentConnectTimedOut = false;
     }
-    else
-    {
-      clearStayAwakeWifiFailureTracking();
-    }
     Serial.printf("V17 Stay Awake: %s (deep sleep %s).\n",
                   disabled ? "ON" : "OFF", disabled ? "nonaktif" : "aktif");
   }
@@ -2484,7 +2598,24 @@ namespace
       Serial.printf("Siklus selesai dalam %lu ms; NTP belum tersedia; "
                     "deep sleep relatif %lu ms.\n",
                     static_cast<unsigned long>(activeDurationMs),
-                    static_cast<unsigned long>(fallbackSleepMs));
+                     static_cast<unsigned long>(fallbackSleepMs));
+    }
+
+    if (wifiOutageActive)
+    {
+      checkpointWifiOutageAwakeTime();
+      const uint64_t sleepSeconds64 = sleepDurationUs / 1000000ULL;
+      const uint32_t sleepSeconds =
+          sleepSeconds64 > UINT32_MAX
+              ? UINT32_MAX
+              : static_cast<uint32_t>(sleepSeconds64);
+      if (appPreferences.putUInt(WIFI_OUTAGE_SLEEP_KEY, sleepSeconds) !=
+          sizeof(uint32_t))
+      {
+        // Losing this checkpoint only delays provisioning; it can never make
+        // the four-hour minimum expire early.
+        Serial.println("WARNING: planned outage sleep duration was not saved.");
+      }
     }
 
     if (telemetryUsesMqtt() && mqttTelemetry != nullptr)
@@ -2524,8 +2655,13 @@ BLYNK_CONNECTED()
     resetSavedWifiRecovery();
     Serial.println("Konfigurasi Edgent tervalidasi; koneksi Blynk aktif.");
   }
-  clearStayAwakeWifiFailureTracking();
-  resetConsecutiveWifiFailures();
+  persistAutomaticWifiRecovery(false);
+  if (!saveLastKnownGoodConfig(configStore))
+  {
+    Serial.println("WARNING: connected Edgent configuration was not saved as "
+                   "the recovery backup.");
+  }
+  resetWifiOutageTracking();
   blynkConnectedAt = millis();
   serviceNetworkTime();
   v6SyncReceived = false;
@@ -2653,14 +2789,31 @@ void setup()
   loadTelemetryBackendConfiguration();
   loadMeasurementTimingConfiguration();
   deepSleepDisabled = appPreferences.getBool(STAY_AWAKE_KEY, false);
-  consecutiveWifiFailedWakeCycles =
-      appPreferences.getUChar(WIFI_FAILURE_COUNT_KEY, 0);
-  if (consecutiveWifiFailedWakeCycles >
-      WIFI_FAILURES_BEFORE_PROVISIONING)
+  wifiOutageActive = appPreferences.getBool(WIFI_OUTAGE_ACTIVE_KEY, false);
+  wifiOutageStartedEpoch =
+      appPreferences.getULong64(WIFI_OUTAGE_STARTED_KEY, 0);
+  wifiOutageElapsedSeconds =
+      appPreferences.getUInt(WIFI_OUTAGE_ELAPSED_KEY, 0);
+  wifiOutageAwakeStartedAt = millis();
+  lastWifiOutageProgressAt = millis();
+  const uint32_t pendingOutageSleepSeconds =
+      appPreferences.getUInt(WIFI_OUTAGE_SLEEP_KEY, 0);
+  appPreferences.remove(WIFI_OUTAGE_SLEEP_KEY);
+  if (wifiOutageActive && pendingOutageSleepSeconds > 0 &&
+      esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
   {
-    consecutiveWifiFailedWakeCycles = 0;
-    appPreferences.putUChar(WIFI_FAILURE_COUNT_KEY, 0);
+    const uint64_t updated =
+        static_cast<uint64_t>(wifiOutageElapsedSeconds) +
+        pendingOutageSleepSeconds;
+    wifiOutageElapsedSeconds =
+        updated > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(updated);
+    appPreferences.putUInt(WIFI_OUTAGE_ELAPSED_KEY,
+                           wifiOutageElapsedSeconds);
   }
+  // Remove the retired three-wake counter during migration.
+  appPreferences.remove("wifi_fail");
+  wifiRecoveryPersisted =
+      appPreferences.getBool(WIFI_RECOVERY_ACTIVE_KEY, false);
   const uint32_t storedSensorHeightMm =
       appPreferences.getUInt("sensor_h_mm", DEFAULT_SENSOR_HEIGHT_MM);
   const uint32_t minimumSensorHeightMm =
@@ -2713,8 +2866,55 @@ void setup()
                           serviceSavedWifiRecovery);
   edgentTimer.setInterval(PROVISIONING_MEASUREMENT_SERVICE_INTERVAL_MS,
                           serviceContinuousMeasurements);
+  if (wifiRecoveryPersisted)
+  {
+    ConfigStore saved = {};
+    if (loadLastKnownGoodConfig(saved))
+    {
+      // A portal candidate can be force-saved before it is proven usable. If
+      // power is lost during that validation, the still-active recovery marker
+      // makes the verified backup authoritative on the next boot.
+      if (memcmp(&configStore, &saved, sizeof(saved)) != 0)
+      {
+        configStore = saved;
+        if (!config_save())
+        {
+          Serial.println("WARNING: recovered last-known-good Edgent config "
+                         "could not be copied back to Blynk NVS.");
+        }
+        Serial.println("Automatic Wi-Fi recovery restored the durable "
+                       "last-known-good Edgent configuration after reboot.");
+      }
+    }
+    else if (!edgentIsConfigured())
+    {
+      Serial.println("WARNING: automatic Wi-Fi recovery was marked active, "
+                     "but no valid credential backup exists; opening normal "
+                     "manual provisioning.");
+      persistAutomaticWifiRecovery(false);
+    }
+  }
+
   edgentConfiguredAtBoot = edgentIsConfigured();
-  provisioningRequested = !edgentConfiguredAtBoot;
+  if (edgentConfiguredAtBoot)
+  {
+    fallbackSavedConfig = configStore;
+    fallbackSavedConfigAvailable = true;
+    saveLastKnownGoodConfig(configStore, false);
+  }
+
+  fallbackProvisioningActive = wifiRecoveryPersisted && edgentConfiguredAtBoot;
+  provisioningRequested = !edgentConfiguredAtBoot || fallbackProvisioningActive;
+  if (fallbackProvisioningActive)
+  {
+    resetSavedWifiRecovery();
+    lastSavedWifiAttemptAt = millis() - SAVED_WIFI_RETRY_INTERVAL_MS;
+    savedWifiReconnectAttempts = 0;
+    BlynkState::set(MODE_WAIT_CONFIG);
+    Serial.println("Provisioning fallback restored after reboot; scheduled "
+                   "measurements and direct retries of the saved Wi-Fi will "
+                   "continue while the Blynk AP is active.");
+  }
   registerA02YYUWConsoleCommand();
 
   Serial.println("INA3221 - CH1 solar, CH2 baterai, CH3 sistem 5V");
@@ -2738,9 +2938,19 @@ void setup()
   Serial.printf("V17 Stay Awake tersimpan: %s (deep sleep %s).\n",
                 deepSleepDisabled ? "ON" : "OFF",
                 deepSleepDisabled ? "nonaktif" : "aktif");
-  Serial.printf("Counter wake gagal Wi-Fi: %u/%u.\n",
-                consecutiveWifiFailedWakeCycles,
-                WIFI_FAILURES_BEFORE_PROVISIONING);
+  if (wifiOutageActive)
+  {
+    Serial.printf("Wi-Fi outage timer restored: %lu/%lu minutes elapsed "
+                  "(minimum four hours before provisioning).\n",
+                  static_cast<unsigned long>(
+                      currentWifiOutageDurationSeconds() / 60UL),
+                  static_cast<unsigned long>(
+                      WIFI_OUTAGE_BEFORE_PROVISIONING_SECONDS / 60UL));
+  }
+  else
+  {
+    Serial.println("Wi-Fi outage timer: inactive (four-hour threshold).");
+  }
 
   if (!writeRegister16(REG_CONFIG, INA3221_CONFIG_ALL_CHANNELS_CONTINUOUS))
   {
@@ -2859,6 +3069,8 @@ void loop()
     // An explicit portal/button reset keeps Edgent's existing destructive
     // reset semantics; only automatic fallback protects the old credentials.
     fallbackProvisioningActive = false;
+    persistAutomaticWifiRecovery(false);
+    clearLastKnownGoodConfig();
     discardFallbackSavedConfig();
     provisioningRequested = true;
     BlynkEdgent.run();
@@ -2888,6 +3100,13 @@ void loop()
   {
     if (provisioningRequested)
     {
+      if (fallbackProvisioningActive)
+      {
+        // Automatic recovery must never route through Edgent's destructive
+        // reset path. Restore the old credentials and keep retrying in AP+STA.
+        restoreFallbackSavedConfig("Edgent entered MODE_ERROR");
+        return;
+      }
       // Kredensial baru gagal divalidasi: jangan tidur. Bersihkan konfigurasi
       // yang gagal lalu buka kembali portal Edgent untuk percobaan berikutnya.
       edgentConnectTimeoutArmed = false;
