@@ -24,8 +24,9 @@ Monitor dan dikirim ke dashboard Blynk melalui Wi-Fi.
 - Mengirim ulang backlog dengan timestamp asli dan menghapus record hanya setelah
   sequence V21 terkonfirmasi dari Blynk.
 - Mengelola provisioning Wi-Fi, koneksi cloud, dan OTA melalui Blynk.Edgent.
-- Membatasi koneksi siklus normal selama 15 detik dan menyediakan jendela OTA
-  15 detik setelah upload.
+- Membatasi pembentukan koneksi siklus normal selama 15 detik. Setelah koneksi
+  berhasil, replay deep-sleep dibatasi maksimum enam record atau 30 detik dan
+  menyediakan jendela OTA sampai 15 detik setelah upload.
 - Menyediakan kontrol V17 untuk menonaktifkan deep sleep dan mempertahankan
   koneksi saat pengujian atau pemeliharaan jarak jauh.
 
@@ -353,16 +354,19 @@ Urutan normal setiap interval pengukuran (default sepuluh menit):
 4. Tetapkan D0 LOW dan tahan pin LOW selama deep sleep.
 5. Baca SHT40 serta seluruh pengukuran INA3221 yang digunakan firmware.
 6. Simpan record bertimestamp ke ring buffer LittleFS sebelum mencoba internet.
-7. Jalankan Blynk.Edgent dengan batas koneksi total 15 detik.
+7. Jalankan Blynk.Edgent dengan batas pembentukan koneksi 15 detik.
 8. Setelah Wi-Fi tersambung, mulai sinkronisasi waktu UTC melalui NTP tanpa
    menghentikan proses Edgent.
 9. Setelah tersambung ke Blynk, kirim data setelah callback sync V6 dan
    V17 diterima.
    Jika Blynk tidak mengirim nilai tersimpan, gunakan tinggi NVS setelah fallback
-   3 detik, tanpa melewati deadline koneksi/upload 15 detik.
+   3 detik. Setelah koneksi berhasil, proses maksimum enam record dalam budget
+   replay 30 detik.
 10. Sinkronkan V21 dan hapus record hanya jika sequence yang diterima sama dengan
-    sequence yang baru dikirim.
-11. Tetap online selama 15 detik sebagai jendela penerimaan Blynk.Air OTA.
+    sequence yang baru dikirim. Jangan mulai replay baru dalam 10 detik sebelum
+    slot ukur dan hentikan ACK tertunda ketika tinggal 5 detik.
+11. Tetap online sampai 15 detik sebagai jendela penerimaan Blynk.Air OTA, tetapi
+    akhiri jendela lebih awal ketika guard slot pengukuran tercapai.
 12. Jika waktu UTC valid, deep sleep sampai batas interval absolut berikutnya.
     Jika waktu belum valid, gunakan sisa interval relatif yang dikonfigurasi.
 
@@ -407,18 +411,26 @@ hanya dikeluarkan dari LittleFS jika sequence yang diterima sama dengan record
 yang sedang menunggu ACK. Timeout atau koneksi terputus membuat record tetap
 tersimpan untuk siklus berikutnya.
 
-Untuk memberi ruang terhadap batas datapoint harian Blynk, firmware mengirim satu
-record pada satu slot dan maksimal dua record pada slot UTC berikutnya. Rata-rata
-maksimum adalah 1,5 record per siklus, sehingga backlog berkurang bertahap ketika
-koneksi pulih. Ketika kapasitas penuh, record tertua dibuang dan penghitung V20
-bertambah. Batas per-siklus ini berlaku pada operasi deep sleep normal; V17
-**Stay Awake** memakai replay satu-record berkelanjutan seperti dijelaskan di
-atas.
+Ketika deep sleep aktif dan koneksi berhasil, firmware memakai kesempatan itu
+untuk mengirim maksimum enam record oldest-first selama maksimum 30 detik.
+Firmware berhenti memulai record baru ketika slot pengukuran berikutnya tinggal
+10 detik dan menghentikan ACK/PUBACK yang masih tertunda ketika tinggal 5 detik.
+Record yang belum mendapat ACK tetap tersimpan. Jendela OTA juga dipersingkat
+bila perlu agar perangkat tidur sebelum batas pengukuran berikutnya. Ketika
+kapasitas penuh, record tertua dibuang dan penghitung V20 bertambah. V17
+**Stay Awake** tetap memakai replay satu-record berkelanjutan seperti dijelaskan
+di atas.
 
 Record yang dibuat setelah UTC tersedia mempertahankan timestamp asli. Record
 yang dibuat setelah cold boot tanpa NTP tetap disimpan, tetapi ketika diunggah
 akan memakai waktu server karena waktu absolut aslinya tidak dapat dipastikan
 tanpa RTC eksternal.
+
+Jika V6 diterima terlambat dan benar-benar mengubah datum setelah record sudah
+diunggah, koreksi V2 dikirim menggunakan timestamp asli record tersebut. Koreksi
+tidak dikirim bila timestamp asli tidak tersedia, sehingga callback V6 tidak
+membuat point Ketinggian Air baru di luar batas interval pengukuran. Sinkronisasi
+V6 dengan nilai yang tidak berubah juga tidak mengirim ulang V2.
 
 Pengujian buffer offline yang disarankan:
 
@@ -532,9 +544,10 @@ SHT40: 28.50 C, 76.20 %RH
 Record #125 disimpan; antrean offline 4/8064.
 Sinkronisasi waktu UTC melalui NTP dimulai.
 Waktu UTC tersedia: 2026-08-07 12:04:27 UTC.
+Replay deep-sleep dimulai: maks 6 record / 30000 ms.
 Record #122 dikirim dengan timestamp asli; menunggu ACK V21.
 ACK record #122 diterima; record dihapus dari antrean.
-Upload siklus selesai (batas replay per siklus tercapai); 1 record dikonfirmasi, antrean tersisa 3; jendela OTA 15000 ms.
+Upload siklus selesai (tidak ada record pending Blynk); 4 record dikonfirmasi, antrean tersisa 0; jendela OTA 15000 ms.
 Siklus selesai dalam 38000 ms; deep sleep 18000 ms; bangun pada 2026-08-07 12:05:00 UTC.
 ```
 
@@ -721,14 +734,14 @@ record baru dihapus setelah packet ID PUBACK yang sama diterima.
 
 ### Lifecycle, log, dan troubleshooting
 
-Per siklus, firmware mencoba koneksi/upload MQTT selama maksimum 15 detik dan
-memakai reconnect backoff tanpa busy-loop. Maksimum replay tetap satu atau dua
-record (sesuai slot UTC), oldest-first, ketika deep sleep aktif. Pada mode V17
-**Stay Awake**, setiap pass tetap oldest-first dan maksimal satu record, tetapi
-pass berikutnya dimulai setelah ACK dan jeda satu detik sampai antrean kosong
-atau slot pengukuran berikutnya tiba. Deep sleep ditahan selama menunggu PUBACK,
-lalu dilanjutkan setelah ACK atau deadline; pada timeout record tetap di
-LittleFS. MQTT diputus sebelum Wi-Fi dimatikan.
+Setelah Wi-Fi tersedia, firmware mencoba koneksi/upload MQTT selama maksimum 15
+detik dan memakai reconnect backoff tanpa busy-loop. Ketika deep sleep aktif,
+maksimum enam record diproses oldest-first di dalam budget replay gabungan 30
+detik dan guard slot pengukuran 10/5 detik. Pada mode V17 **Stay Awake**, setiap
+pass tetap oldest-first dan maksimal satu record, tetapi pass berikutnya dimulai
+setelah ACK dan jeda satu detik sampai antrean kosong atau slot pengukuran
+berikutnya tiba. Deep sleep ditahan selama menunggu PUBACK sampai guard/deadline;
+pada timeout record tetap di LittleFS. MQTT diputus sebelum Wi-Fi dimatikan.
 
 Contoh log normal (tanpa password/token):
 

@@ -6,7 +6,7 @@
 #include "TelemetryPayload.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.6.2"
+#define BLYNK_FIRMWARE_VERSION "1.6.4"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -79,11 +79,14 @@ namespace
   constexpr uint32_t MINIMUM_SLEEP_MS = 1000;
   constexpr uint32_t NTP_SYNC_STATUS_TIMEOUT_MS = 10000;
   constexpr uint32_t UPLOAD_ACK_REQUEST_DELAY_MS = 100;
-  constexpr uint32_t UPLOAD_ACK_TIMEOUT_MS = 1500;
+  constexpr uint32_t UPLOAD_ACK_TIMEOUT_MS = 5000;
   constexpr uint32_t MQTT_UPLOAD_DEADLINE_MS = 15000;
   constexpr uint32_t MQTT_DISCONNECT_GRACE_MS = 100;
   constexpr uint32_t STAY_AWAKE_REPLAY_GAP_MS = 1000;
-  constexpr uint8_t MAX_RECORD_UPLOADS_PER_CYCLE = 2;
+  constexpr uint32_t DEEP_SLEEP_REPLAY_BUDGET_MS = 30000;
+  constexpr uint32_t DEEP_SLEEP_NEW_REPLAY_GUARD_MS = 10000;
+  constexpr uint32_t DEEP_SLEEP_SLEEP_GUARD_MS = 5000;
+  constexpr uint8_t DEEP_SLEEP_REPLAY_RECORD_LIMIT = 6;
   constexpr time_t MIN_VALID_UTC_EPOCH = 1704067200; // 2024-01-01 00:00 UTC
   constexpr char NTP_SERVER_PRIMARY[] = "pool.ntp.org";
   constexpr char NTP_SERVER_SECONDARY[] = "time.google.com";
@@ -210,6 +213,7 @@ namespace
   tide::MeasurementRecord currentCycleRecord = {};
   bool currentCycleRecordReady = false;
   bool currentCycleRecordQueued = false;
+  bool currentCycleRecordSentToBlynk = false;
   uint32_t currentCycleSequence = 0;
   uint8_t recordsUploadedThisCycle = 0;
   uint8_t blynkRecordsAcknowledgedThisCycle = 0;
@@ -225,6 +229,8 @@ namespace
   TelemetryBackend activeTelemetryBackend = TELEMETRY_BACKEND_MODE;
   bool mqttUploadDeadlineArmed = false;
   uint32_t mqttUploadDeadlineStartedAt = 0;
+  bool deepSleepReplayWindowArmed = false;
+  uint32_t deepSleepReplayStartedAt = 0;
   bool cycleStartedDuringProvisioning = false;
 
   enum class SavedWifiRecoveryState : uint8_t
@@ -369,6 +375,77 @@ namespace
     }
 
     return millis() - cycleStartedAt >= measurementIntervalSeconds * 1000UL;
+  }
+
+  bool millisecondsUntilNextMeasurement(uint32_t &remainingMs)
+  {
+    timeval utcNow = {};
+    if (getValidUtcTime(utcNow))
+    {
+      const uint64_t currentSlot =
+          static_cast<uint64_t>(utcNow.tv_sec) / measurementIntervalSeconds;
+      if (cycleAbsoluteSlotValid && currentSlot > cycleAbsoluteSlot)
+      {
+        remainingMs = 0;
+        return true;
+      }
+
+      constexpr uint64_t MICROSECONDS_PER_SECOND = 1000000ULL;
+      const uint64_t intervalUs =
+          static_cast<uint64_t>(measurementIntervalSeconds) *
+          MICROSECONDS_PER_SECOND;
+      const uint64_t currentEpochUs =
+          static_cast<uint64_t>(utcNow.tv_sec) * MICROSECONDS_PER_SECOND +
+          static_cast<uint32_t>(utcNow.tv_usec);
+      const uint64_t remainingUs = intervalUs - currentEpochUs % intervalUs;
+      remainingMs = static_cast<uint32_t>(remainingUs / 1000ULL);
+      return true;
+    }
+
+    const uint32_t intervalMs = measurementIntervalSeconds * 1000UL;
+    const uint32_t elapsedMs = millis() - cycleStartedAt;
+    remainingMs = elapsedMs >= intervalMs ? 0 : intervalMs - elapsedMs;
+    return true;
+  }
+
+  bool deepSleepMeasurementDeadlineWithin(uint32_t guardMs)
+  {
+    if (deepSleepDisabled)
+    {
+      return false;
+    }
+
+    uint32_t remainingMs = 0;
+    return millisecondsUntilNextMeasurement(remainingMs) &&
+           remainingMs <= guardMs;
+  }
+
+  bool deepSleepReplayBudgetExpired()
+  {
+    return !deepSleepDisabled && deepSleepReplayWindowArmed &&
+           millis() - deepSleepReplayStartedAt >=
+               DEEP_SLEEP_REPLAY_BUDGET_MS;
+  }
+
+  bool canStartAnotherOfflineReplay()
+  {
+    return deepSleepDisabled ||
+           (!deepSleepReplayBudgetExpired() &&
+            !deepSleepMeasurementDeadlineWithin(
+                DEEP_SLEEP_NEW_REPLAY_GUARD_MS));
+  }
+
+  void armDeepSleepReplayWindow()
+  {
+    if (deepSleepDisabled || deepSleepReplayWindowArmed)
+    {
+      return;
+    }
+    deepSleepReplayWindowArmed = true;
+    deepSleepReplayStartedAt = millis();
+    Serial.printf("Replay deep-sleep dimulai: maks %u record / %lu ms.\n",
+                  DEEP_SLEEP_REPLAY_RECORD_LIMIT,
+                  static_cast<unsigned long>(DEEP_SLEEP_REPLAY_BUDGET_MS));
   }
 
   bool calculateAbsoluteSleep(uint64_t &sleepDurationUs,
@@ -1028,6 +1105,29 @@ namespace
     Blynk.virtualWrite(V16, record.acquisitionDurationMs);
     Blynk.virtualWrite(V21, record.sequence);
     Blynk.endGroup();
+    if (currentCycleRecordReady &&
+        record.sequence == currentCycleRecord.sequence)
+    {
+      currentCycleRecordSentToBlynk = true;
+    }
+  }
+
+  bool sendTimestampedWaterLevelCorrection(
+      const tide::MeasurementRecord &record)
+  {
+    if (!Blynk.connected() ||
+        (record.flags & tide::RECORD_DISTANCE_VALID) == 0 ||
+        (record.flags & tide::RECORD_TIME_VALID) == 0)
+    {
+      return false;
+    }
+
+    // A late V6 sync must correct the existing measurement slot, never create
+    // a standalone point stamped with the callback/server time.
+    Blynk.beginGroup(record.timestampMs);
+    Blynk.virtualWrite(V2, record.waterLevelMm / 1000.0f);
+    Blynk.endGroup();
+    return true;
   }
 
   void publishOfflineQueueDiagnostics()
@@ -1057,11 +1157,9 @@ namespace
       return 1;
     }
 
-    // Dua record hanya pada setiap dua slot UTC. Rata-rata 1,5 record/siklus
-    // memberi ruang terhadap batas datapoint harian sambil menguras backlog.
-    return cycleAbsoluteSlotValid && (cycleAbsoluteSlot % 2ULL) == 0
-               ? MAX_RECORD_UPLOADS_PER_CYCLE
-               : 1;
+    // A bounded burst makes use of a successful weak-network connection while
+    // the time and record caps keep battery/cloud usage deterministic.
+    return DEEP_SLEEP_REPLAY_RECORD_LIMIT;
   }
 
   void finishUploadWorkForCycle(const char *reason)
@@ -1129,6 +1227,54 @@ namespace
     }
   }
 
+  bool stopDeepSleepReplayAtDeadline()
+  {
+    if (deepSleepDisabled || cycleUploaded || !currentCycleRecordReady)
+    {
+      return false;
+    }
+
+    const bool budgetExpired = deepSleepReplayBudgetExpired();
+    const bool measurementNear = deepSleepMeasurementDeadlineWithin(
+        DEEP_SLEEP_SLEEP_GUARD_MS);
+    if (!budgetExpired && !measurementNear)
+    {
+      return false;
+    }
+
+    const char *reason = measurementNear
+                             ? "deadline pengukuran berikutnya"
+                             : "budget replay deep-sleep habis";
+    if (offlineUploadState != OfflineUploadState::IDLE)
+    {
+      Serial.printf("Replay Blynk sequence=%lu dihentikan (%s); record tetap "
+                    "disimpan.\n",
+                    static_cast<unsigned long>(pendingUploadSequence), reason);
+    }
+    if (telemetryUsesMqtt() && mqttTelemetry != nullptr &&
+        mqttTelemetry->awaitingPuback())
+    {
+      Serial.printf("Replay MQTT dihentikan (%s); record tanpa PUBACK tetap "
+                    "disimpan.\n",
+                    reason);
+    }
+
+    offlineUploadState = OfflineUploadState::IDLE;
+    pendingUploadSequence = 0;
+    pendingUploadAcknowledged = false;
+    if (!blynkUploadFinishedForCycle)
+    {
+      finishDestinationUploadForCycle(tide::TelemetryDestination::BLYNK,
+                                      reason);
+    }
+    if (!mqttUploadFinishedForCycle)
+    {
+      finishDestinationUploadForCycle(tide::TelemetryDestination::MQTT,
+                                      reason);
+    }
+    return true;
+  }
+
   void recordDurableDeliveryAcknowledgement(
       uint32_t sequence, tide::TelemetryDestination destination,
       const char *destinationName)
@@ -1174,6 +1320,7 @@ namespace
 
   void beginOfflineRecordUpload(const tide::MeasurementRecord &record)
   {
+    armDeepSleepReplayWindow();
     pendingUploadSequence = record.sequence;
     pendingUploadAcknowledged = false;
     sendRecordToBlynk(record);
@@ -1254,6 +1401,17 @@ namespace
       return;
     }
 
+    if (!canStartAnotherOfflineReplay())
+    {
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::BLYNK,
+          deepSleepMeasurementDeadlineWithin(
+              DEEP_SLEEP_NEW_REPLAY_GUARD_MS)
+              ? "menjaga slot pengukuran berikutnya"
+              : "budget replay deep-sleep habis");
+      return;
+    }
+
     tide::MeasurementRecord record = {};
     bool hasPending = false;
     if (!offlineQueue.peekPendingDelivery(
@@ -1277,7 +1435,8 @@ namespace
   void armMqttUploadDeadline()
   {
     if (!telemetryUsesMqtt() || mqttUploadFinishedForCycle ||
-        mqttUploadDeadlineArmed || cycleUploaded || !currentCycleRecordReady)
+        mqttUploadDeadlineArmed || cycleUploaded || !currentCycleRecordReady ||
+        WiFi.status() != WL_CONNECTED)
     {
       return;
     }
@@ -1311,7 +1470,13 @@ namespace
                     static_cast<unsigned>(sizeof(payload)));
       return false;
     }
-    return mqttTelemetry->publish(record.sequence, payload, payloadLength);
+    const bool published =
+        mqttTelemetry->publish(record.sequence, payload, payloadLength);
+    if (published)
+    {
+      armDeepSleepReplayWindow();
+    }
+    return published;
   }
 
   void serviceMqttOfflineUpload()
@@ -1383,6 +1548,17 @@ namespace
       finishDestinationUploadForCycle(
           tide::TelemetryDestination::MQTT,
           "batas replay MQTT per siklus tercapai");
+      return;
+    }
+
+    if (!canStartAnotherOfflineReplay())
+    {
+      finishDestinationUploadForCycle(
+          tide::TelemetryDestination::MQTT,
+          deepSleepMeasurementDeadlineWithin(
+              DEEP_SLEEP_NEW_REPLAY_GUARD_MS)
+              ? "menjaga slot pengukuran berikutnya"
+              : "budget replay deep-sleep habis");
       return;
     }
 
@@ -1815,6 +1991,7 @@ namespace
     currentCycleRecord = {};
     currentCycleRecordReady = false;
     currentCycleRecordQueued = false;
+    currentCycleRecordSentToBlynk = false;
     currentCycleSequence = 0;
     recordsUploadedThisCycle = 0;
     blynkRecordsAcknowledgedThisCycle = 0;
@@ -1826,6 +2003,8 @@ namespace
     offlineUploadState = OfflineUploadState::IDLE;
     mqttUploadDeadlineArmed = false;
     mqttUploadDeadlineStartedAt = 0;
+    deepSleepReplayWindowArmed = false;
+    deepSleepReplayStartedAt = 0;
     edgentConnectTimeoutArmed = false;
     edgentConnectTimedOut = false;
     edgentConnectStartedAt = 0;
@@ -2549,6 +2728,14 @@ namespace
     {
       edgentConnectTimeoutArmed = false;
       edgentConnectTimedOut = false;
+      deepSleepReplayWindowArmed = false;
+      deepSleepReplayStartedAt = 0;
+    }
+    else if (currentCycleRecordReady && !cycleUploaded)
+    {
+      // V17 may be turned off while continuous replay is already in flight.
+      // Start the bounded window now so the transition cannot run unbounded.
+      armDeepSleepReplayWindow();
     }
     Serial.printf("V17 Stay Awake: %s (deep sleep %s).\n",
                   disabled ? "ON" : "OFF", disabled ? "nonaktif" : "aktif");
@@ -2663,6 +2850,13 @@ BLYNK_CONNECTED()
   }
   resetWifiOutageTracking();
   blynkConnectedAt = millis();
+  if (!deepSleepDisabled)
+  {
+    // The Edgent deadline bounds connection establishment. Once connected,
+    // the separate replay window owns the bounded upload time.
+    edgentConnectTimeoutArmed = false;
+    edgentConnectTimedOut = false;
+  }
   serviceNetworkTime();
   v6SyncReceived = false;
   v17SyncReceived = false;
@@ -2738,16 +2932,20 @@ BLYNK_WRITE(V6)
 
   const uint32_t requestedHeightMm =
       static_cast<uint32_t>(requestedHeightM * 1000.0f + 0.5f);
-  if (requestedHeightMm != sensorHeightMm)
+  const bool sensorHeightChanged = requestedHeightMm != sensorHeightMm;
+  if (sensorHeightChanged)
   {
     sensorHeightMm = requestedHeightMm;
     appPreferences.putUInt("sensor_h_mm", sensorHeightMm);
   }
   if (distanceValid)
   {
-    latestWaterLevelMm =
+    const int32_t correctedWaterLevelMm =
         static_cast<int32_t>(sensorHeightMm) - latestDistanceMm;
-    if (currentCycleRecordReady &&
+    const bool waterLevelChanged =
+        correctedWaterLevelMm != latestWaterLevelMm;
+    latestWaterLevelMm = correctedWaterLevelMm;
+    if (waterLevelChanged && currentCycleRecordReady &&
         (currentCycleRecord.flags & tide::RECORD_DISTANCE_VALID) != 0)
     {
       currentCycleRecord.waterLevelMm = latestWaterLevelMm;
@@ -2757,15 +2955,25 @@ BLYNK_WRITE(V6)
       {
         Serial.println("PERINGATAN: koreksi datum record terbaru gagal disimpan.");
       }
-    }
-    if (cycleUploaded && Blynk.connected())
-    {
-      // Koreksi V2 apabila balasan sync V6 datang setelah fallback upload.
-      Blynk.virtualWrite(V2, latestWaterLevelMm / 1000.0f);
+      if (currentCycleRecordSentToBlynk && Blynk.connected())
+      {
+        if (sendTimestampedWaterLevelCorrection(currentCycleRecord))
+        {
+          Serial.printf("Koreksi V2 record #%lu dikirim pada timestamp "
+                        "pengukuran asli.\n",
+                        static_cast<unsigned long>(currentCycleRecord.sequence));
+        }
+        else
+        {
+          Serial.println("Koreksi V2 tidak dikirim: timestamp pengukuran asli "
+                         "tidak tersedia; point di luar slot dihindari.");
+        }
+      }
     }
   }
-  Serial.printf("Tinggi referensi sensor diubah dari Blynk: %.3f m\n",
-                sensorHeightMm / 1000.0f);
+  Serial.printf("Tinggi referensi sensor dari Blynk: %.3f m (%s).\n",
+                sensorHeightMm / 1000.0f,
+                sensorHeightChanged ? "diperbarui" : "tidak berubah");
 }
 
 void setup()
@@ -3050,6 +3258,10 @@ void loop()
   // records even while Blynk Cloud is unavailable.
   if (automaticMeasurementComplete && otherMeasurementsComplete)
   {
+    if (stopDeepSleepReplayAtDeadline())
+    {
+      return;
+    }
     serviceMqttOfflineUpload();
   }
 
@@ -3154,7 +3366,9 @@ void loop()
       beginStayAwakeQueueDrainPass();
       BlynkEdgent.run();
     }
-    else if (!Blynk.connected() ||
+    else if (deepSleepMeasurementDeadlineWithin(
+                 DEEP_SLEEP_SLEEP_GUARD_MS) ||
+             !Blynk.connected() ||
              millis() - cycleUploadedAt >= OTA_LISTEN_WINDOW_MS)
     {
       enterTimedDeepSleep();
