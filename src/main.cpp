@@ -6,7 +6,7 @@
 #include "TelemetryPayload.h"
 #include "secrets.h"
 
-#define BLYNK_FIRMWARE_VERSION "1.6.1"
+#define BLYNK_FIRMWARE_VERSION "1.6.2"
 #define BLYNK_PRINT Serial
 #include <DNSServer.h>
 #include <HTTPClient.h>
@@ -2598,7 +2598,7 @@ namespace
       Serial.printf("Siklus selesai dalam %lu ms; NTP belum tersedia; "
                     "deep sleep relatif %lu ms.\n",
                     static_cast<unsigned long>(activeDurationMs),
-                     static_cast<unsigned long>(fallbackSleepMs));
+                    static_cast<unsigned long>(fallbackSleepMs));
     }
 
     if (wifiOutageActive)
